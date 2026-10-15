@@ -1,0 +1,56 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: CVE-2026-90817 REDCap Compromise Scanner
+message:
+  If you use this software, please cite it using the metadata
+  in CITATION.cff
+type: software
+authors:
+  - family-names: Chase
+    given-names: Philip B
+    email: pbc@ufl.edu
+    affiliation: University of Florida
+    orcid: https://orcid.org/0000-0002-5318-9420
+  - family-names: Stoffs
+    given-names: Taryn L
+    email: tls@ufl.edu
+    affiliation: University of Florida
+    orcid: https://orcid.org/0000-0002-0830-8179
+abstract:
+  A read-only, passive scanner that checks a REDCap host for exposure
+  to and compromise by CVE-2026-90817, the unauthenticated survey-endpoint
+  remote-code-execution vulnerability abused by the XMRig cryptomining
+  campaign. It compares the installed REDCap version against the patched
+  releases and hunts the documented indicators of compromise (web shell,
+  miner staging, masquerading processes, local miner API, attacker-IP
+  connections, cron/SSH/profile persistence, and anti-forensics) without
+  sending any HTTP requests or reproducing the exploit. It distinguishes
+  the DataImportController-via-survey-passthru attack hallmark from
+  legitimate REDCap traffic and correlates attack timestamps in the
+  web-server logs against the mitigation date to judge compromise
+  likelihood.
+keywords:
+  - redcap
+  - security
+  - cve-2026-90817
+  - vulnerability scanner
+  - compromise assessment
+  - incident response
+  - threat detection
+  - xmrig
+license: Apache-2.0
+version: 1.0.0
+references:
+  - type: article
+    title: XMRig campaign through CVE-2026-90817
+    authors:
+      - name: Palo Alto Networks Unit 42
+    year: 2026
+    date-published: '2026-10-07'
+    url:
+      https://github.com/PaloAltoNetworks/Unit42-timely-threat-intel/blob/main/2026-10-07-XMRig-campaign-through-CVE-2026-90817.txt
+    notes:
+      Threat-intelligence report that this scanner's detection logic and
+      indicators of compromise are derived from.
