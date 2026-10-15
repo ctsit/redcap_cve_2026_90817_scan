@@ -140,3 +140,8 @@ always force `LIKELY COMPROMISED` regardless of timing.
   "undated" and flagged for manual review rather than silently dropped.
 - IOC definitions live in one clearly-marked constants block at the top of the
   script — update them there if the vendor publishes more indicators.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) and
+[`NOTICE`](NOTICE). Copyright 2026 University of Florida.
