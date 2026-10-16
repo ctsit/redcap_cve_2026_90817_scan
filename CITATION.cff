@@ -43,6 +43,7 @@ keywords:
 license: Apache-2.0
 version: 1.0.0
 date-released: '2026-10-16'
+doi: 10.5281/zenodo.23426068
 references:
   - type: article
     title: XMRig campaign through CVE-2026-90817
