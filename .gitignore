@@ -1,2 +1,4 @@
 *result*
 __pycache__
+*map*.txt
+!sanitize_scan_result.py
