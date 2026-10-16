@@ -25,7 +25,11 @@ It is intended for an administrator running it against **their own** REDCap serv
 
 ## Requirements
 
-- Python 3.9+ (Debian 12 ships 3.11). **Standard library only** — no `pip` installs.
+- Python 3.7+. **Standard library only** — no `pip` installs.
+- Runs on **Debian- and RHEL-family** Linux. Apache logs are auto-scanned at
+  `/var/log/apache2` (Debian) or `/var/log/httpd` (RHEL/CentOS/Rocky/Alma), and
+  nginx at `/var/log/nginx`. On RHEL 8 the system `python3` is 3.6, so invoke
+  `python3.9` (or newer) there; RHEL/Rocky/Alma 9 ship 3.9+.
 - Run as **root** for a complete scan (per-user crontabs, other users'
   `authorized_keys` and `/proc/<pid>/exe`, and some logs are otherwise unreadable).
   Without root it still runs and clearly marks the result as a partial scan.
@@ -54,7 +58,7 @@ when scanning a possibly-tampered host.
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `--redcap-root PATH` | `/var/www/html/redcap` | REDCap install root. |
-| `--log-dir DIR` (repeatable) | `/var/log/apache2`, `/var/log/nginx` | Web-server log directories to scan (handles rotated `.gz`). |
+| `--log-dir DIR` (repeatable) | `/var/log/apache2`, `/var/log/httpd`, `/var/log/nginx` | Web-server log directories to scan (handles rotated `.gz`). |
 | `--home-dir DIR` (repeatable) | `/root` + each `/home/*` | Extra home dirs to scan for SSH keys / shell rc files. |
 | `--mitigation-date YYYY-MM-DD` | *auto-detected* | Date the vulnerability was closed by upgrading. See [Attack timing](#attack-timing). |
 | `--full-hash-scan` | off | Recursively hash files under `temp/cache` and staging dirs (slower). |

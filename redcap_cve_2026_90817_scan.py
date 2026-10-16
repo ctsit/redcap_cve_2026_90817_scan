@@ -36,7 +36,8 @@ NEVER modifies, quarantines, or removes anything. It only reads files,
 processes, sockets, and logs. Run as root for a complete scan; it degrades
 gracefully (and says so) without privileges.
 
-Stdlib only. Python 3.9+. Tested target: Debian 12.
+Stdlib only. Python 3.7+. Runs on Debian- and RHEL-family Linux
+(Apache logs at /var/log/apache2 or /var/log/httpd are auto-detected).
 
 Usage:
     sudo python3 -I redcap_cve_2026_90817_scan.py [--redcap-root PATH] [--json]
@@ -192,7 +193,7 @@ class Report:
 def is_root() -> bool:
     try:
         return os.geteuid() == 0
-    except AttributeError:       # non-POSIX; should not happen on Debian
+    except AttributeError:       # non-POSIX platform (no geteuid)
         return False
 
 
@@ -1069,7 +1070,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="REDCap install root (default: /var/www/html/redcap)")
     p.add_argument("--log-dir", action="append", default=None,
                    help="Web-server log dir to scan (repeatable). "
-                        "Default: /var/log/apache2 and /var/log/nginx.")
+                        "Default: /var/log/apache2, /var/log/httpd, /var/log/nginx.")
     p.add_argument("--home-dir", action="append", default=None,
                    help="Extra home dir to scan for SSH keys / rc files (repeatable).")
     p.add_argument("--full-hash-scan", action="store_true",
@@ -1091,7 +1092,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_arg_parser().parse_args(argv)
-    log_dirs = args.log_dir or ["/var/log/apache2", "/var/log/nginx"]
+    log_dirs = args.log_dir or ["/var/log/apache2", "/var/log/httpd", "/var/log/nginx"]
     homes = list_home_dirs(args.home_dir)
 
     rep = Report()
