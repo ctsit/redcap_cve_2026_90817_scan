@@ -1,5 +1,7 @@
 # CVE-2026-90817 REDCap compromise scanner
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23426068.svg)](https://doi.org/10.5281/zenodo.23426068)
+
 `redcap_cve_2026_90817_scan.py` is a **read-only, passive** scanner that checks a
 REDCap host for exposure to and compromise by **CVE-2026-90817** — the
 unauthenticated survey-endpoint remote-code-execution flaw abused by the XMRig
