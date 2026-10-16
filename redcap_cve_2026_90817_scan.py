@@ -76,9 +76,12 @@ IOC_POOL_DOMAIN = "auto.c3pool.org"         # mining pool
 IOC_DROPPER_SHA256 = (
     "39a435123dc1fffd499aa2acf11ef46e3ee2e805bf137811af0c2c5b12546920"
 )
-IOC_WEBSHELL_BASENAME = (
-    "d3f11fc8ee9c2d986425eff26ecace5b4004eb8e.bladec"
-)
+# NOTE: `.bladec` files in temp/cache are NOT an indicator. REDCap core uses the
+# BladeOne template engine, which compiles views to hash-named `.bladec` files in
+# temp/cache as normal output -- so the extension (and any incident-specific
+# compiled-template hash name) is routine, not malicious. A genuinely malicious
+# file dropped there is still caught by content hash in check_hashes(), which is
+# extension-independent. Do NOT reintroduce a `.bladec`-extension web-shell check.
 IOC_MINER_ARCHIVE = "/var/tmp/.syslog-a224be51/xmrig.tar.gz"
 IOC_COMPETITOR_DIRS = ["/dev/shm/duet", "/var/tmp/.bin"]
 IOC_MONERO_WALLET = (
@@ -526,29 +529,10 @@ def check_version(rep: Report, redcap_root: str) -> None:
                         evidence=[f"installed: {vstr}"]))
 
 
-def check_webshell(rep: Report, redcap_root: str) -> None:
-    cache = os.path.join(redcap_root, "temp", "cache")
-    exact = os.path.join(cache, IOC_WEBSHELL_BASENAME)
-    if os.path.exists(exact):
-        rep.add(Finding(SEV_CRITICAL, "webshell",
-                        "Known CVE-2026-90817 web shell present",
-                        "The exact dropped Blade web shell from the Unit 42 "
-                        "report exists.",
-                        evidence=[f"{exact} (mtime {mtime_str(exact)})"]))
-    try:
-        others = [p for p in glob.glob(os.path.join(cache, "*.bladec"))
-                  if os.path.abspath(p) != os.path.abspath(exact)]
-    except OSError:
-        others = []
-    if others:
-        rep.add(Finding(SEV_HIGH, "webshell",
-                        "Unexpected .bladec file(s) in REDCap temp/cache",
-                        "Compiled Blade templates are not normal in a REDCap "
-                        "temp/cache directory; the campaign drops its web shell "
-                        "with this extension. Review each file.",
-                        evidence=[f"{p} (mtime {mtime_str(p)})" for p in others]))
-    if not os.path.isdir(cache):
-        rep.note(f"temp/cache not found under {redcap_root!r}; web-shell check limited.")
+# (Deliberately no web-shell-by-extension check: see the IOC-block note on
+# `.bladec`. REDCap/BladeOne writes hash-named `.bladec` files to temp/cache as
+# normal output, so flagging the extension produced false positives. Known-bad
+# files in temp/cache are still detected by content hash in check_hashes().)
 
 
 def check_staging(rep: Report) -> None:
@@ -902,15 +886,17 @@ def check_access_logs(rep: Report, log_dirs: list, mitigation_date=None,
                     m = INTERNAL_CONTROLLER_RE.search(_url_unquote_recursive(line))
                     if m:
                         agg["controllers"].add(m.group(1))
-                    # Rank by status/size: a 2xx means the passthru actually
-                    # routed to the controller (technique worked); anything else
-                    # is an attempt that did not route.
+                    # Rank by status: a 2xx means the passthru REACHED the
+                    # controller unauthenticated -- reachability, NOT proof that
+                    # code executed or that the host was compromised. Anything
+                    # else is an attempt that did not reach.
                     if status and status.startswith("2"):
-                        rank = ("passthru routed to internal controller -- "
-                                "technique succeeded (impact depends on the "
-                                "controller)")
+                        rank = (f"reached the controller (HTTP {status}) -- "
+                                "endpoint reachable unauthenticated; "
+                                "reachability, not proof of code execution or "
+                                "compromise")
                     elif status:
-                        rank = f"attempt -- did not route (HTTP {status})"
+                        rank = f"attempt -- did not reach (HTTP {status})"
                     else:
                         rank = "attempt (status not parseable)"
                     if unlimited or len(exploit_ev) < max_matches:
@@ -974,9 +960,9 @@ def check_access_logs(rep: Report, log_dirs: list, mitigation_date=None,
                   "double-encoded index.php (the campaign's generalizable "
                   "signature), or using the known attacker survey hash. This is an "
                   "exploitation ATTEMPT in the logs -- a 2xx means the passthru "
-                  "routed to the controller (technique worked), but the host-state "
-                  "checks above (web shell, miner, persistence) are what confirm an "
-                  "actual compromise.")
+                  "REACHED the controller unauthenticated (reachability), NOT that "
+                  "code executed; the host-state checks above (miner, persistence, "
+                  "known-bad file hashes) are what confirm an actual compromise.")
         if len(exploit_ips) > 1 or (exploit_ips and exploit_ips[0] != IOC_SOURCE_IP):
             detail += (f" Distinct source IP(s) issuing exploit-shaped requests: "
                        f"{', '.join(exploit_ips)}.")
@@ -1035,7 +1021,7 @@ def verdict(rep: Report) -> str:
     # "compromised" verdict outright. Web-server log hits are attacks against
     # the endpoint; whether they imply compromise depends on their timing vs.
     # the mitigation date, handled in _attack_timing_verdict.
-    host_state = {"webshell", "staging", "hash", "process", "socket",
+    host_state = {"staging", "hash", "process", "socket",
                   "cron", "ssh", "profile"}
     worst = SEV_OK
     for f in rep.findings:
@@ -1264,7 +1250,6 @@ def main(argv=None) -> int:
     # Each check is isolated so one failure never aborts the scan.
     checks = [
         ("version", lambda: check_version(rep, args.redcap_root)),
-        ("webshell", lambda: check_webshell(rep, args.redcap_root)),
         ("staging", lambda: check_staging(rep)),
         ("hash", lambda: check_hashes(rep, args.redcap_root, args.full_hash_scan)),
         ("process", lambda: check_processes(rep)),

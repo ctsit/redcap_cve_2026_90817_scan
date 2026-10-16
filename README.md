@@ -81,11 +81,14 @@ Each documented IOC maps to a passive local check:
 - **Version / patch state** — reads the installed version from the `redcap_vX.Y.Z`
   directory names and compares against the patched releases
   (**16.0.49 LTS / 17.3.10 LTS / 17.4.4 Standard**; affected floor 13.3.0).
-- **Web shell** — the exact dropped `*.bladec` file, and any unexpected `.bladec`
-  in `temp/cache/`.
+- **Known-bad files in `temp/cache`** — every file there (and in the staging
+  dirs) is hashed against the Unit 42 dropper SHA-256. Note: the tool does **not**
+  flag files by the `.bladec` extension. REDCap core uses the BladeOne template
+  engine, which writes hash-named `.bladec` compiled templates to `temp/cache` as
+  normal output, so the extension is not an indicator of compromise; a genuinely
+  malicious dropped file is caught by its content hash, regardless of extension.
 - **Miner staging** — `.syslog-*` dirs, `xmrig*` archives, and the competitor
   directories (`/dev/shm/duet`, `/var/tmp/.bin`) the campaign locks to perms `000`.
-- **Known-bad hash** — files matching the Unit 42 dropper SHA-256.
 - **Processes** — miners (XMRig / pool / wallet references), executables running
   from `/var/tmp`, `/dev/shm`, `/tmp`, and `syslog-ng-*` masquerading processes.
 - **Sockets** — the local XMRig JSON-RPC API on `127.0.0.1:50001`, and live
@@ -122,9 +125,10 @@ reconnaissance (MEDIUM), not as an exploit-shaped request.
 Because detection is by request *pattern*, not by IP, the scanner **aggregates every
 distinct source IP** that issued an exploit-shaped request and calls out any beyond
 the documented IOC IP. Each exploit hit is also **ranked by HTTP status**: a `2xx`
-means the `__passthru` actually routed to the controller (technique worked), while a
-non-`2xx` is an attempt that did not route. (A technique that worked is still only an
-*attempt* at compromise — the host-state checks are what confirm an actual breach.)
+means the `__passthru` **reached** the controller unauthenticated, while a non-`2xx`
+is an attempt that did not reach it. Reaching the controller is *reachability*, **not**
+proof that code executed or that the host was compromised — the host-state checks are
+what confirm an actual breach.
 
 Matched entries are kept **verbatim and untruncated**, each prefixed with its parsed
 date, the reason(s) it matched, and the status ranking, so the raw evidence is
@@ -145,8 +149,8 @@ when they happened relative to the patch. The scanner buckets every attack entry
 The mitigation date comes from `--mitigation-date`, or, if that's omitted, is
 inferred from the install mtime of the **earliest patched** `redcap_vX.Y.Z`
 directory (the moment the host first ran a non-vulnerable version). The report
-header shows which source was used. Host-state IOCs (web shell, miner, persistence)
-always force `LIKELY COMPROMISED` regardless of timing.
+header shows which source was used. Host-state IOCs (known-bad file hash, miner,
+persistence) always force `LIKELY COMPROMISED` regardless of timing.
 
 ## Caveats
 
