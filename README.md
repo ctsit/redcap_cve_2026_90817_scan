@@ -101,19 +101,34 @@ Each documented IOC maps to a passive local check:
 ### Web-log detection (how false positives are avoided)
 
 `__passthru` and `route=` on their own are **legitimate REDCap parameters** —
-External Modules route through `__passthru`, and normal survey traffic uses
+External Modules route through `__passthru`, and normal survey traffic uses a plain
 `__passthru=index.php` to reach benign controllers like `PdfController` and
 `SendItController`. The scanner therefore never matches on those alone. A log line
-is treated as an attack only when it shows:
+is treated as **exploit-shaped** only when it shows:
 
-- the attack **hallmark** — `__passthru` reaching **`DataImportController`** (the
-  line is URL-decoded first, so obfuscation like `%2569ndex.php` is still caught); or
-- the specific attacker **survey hash** from the report; or
-- traffic **from the known attacker source IP** (classified separately as
-  reconnaissance, not an exploit-shaped request).
+- the **RCE sink** — `__passthru` reaching **`DataImportController`** (the report's
+  documented sink), at any encoding; or
+- a **double-encoded** `__passthru` reaching **any** internal `…Controller` — e.g.
+  `__passthru=%2569ndex.php&route=ParcelController:show`. This is the campaign's
+  generalizable signature: legitimate clients send a plain, literal `index.php`,
+  never a double-encoded one, so the **obfuscation** (not the controller name, not
+  the HTTP status) is what distinguishes the attack. This is what catches attacker
+  hosts *other than* the one documented IOC IP; or
+- the specific attacker **survey hash** from the report.
+
+Traffic merely **from the known attacker source IP** is classified separately as
+reconnaissance (MEDIUM), not as an exploit-shaped request.
+
+Because detection is by request *pattern*, not by IP, the scanner **aggregates every
+distinct source IP** that issued an exploit-shaped request and calls out any beyond
+the documented IOC IP. Each exploit hit is also **ranked by HTTP status**: a `2xx`
+means the `__passthru` actually routed to the controller (technique worked), while a
+non-`2xx` is an attempt that did not route. (A technique that worked is still only an
+*attempt* at compromise — the host-state checks are what confirm an actual breach.)
 
 Matched entries are kept **verbatim and untruncated**, each prefixed with its parsed
-date and the reason(s) it matched, so the raw evidence is preserved for review.
+date, the reason(s) it matched, and the status ranking, so the raw evidence is
+preserved for review.
 
 ### Attack timing
 

@@ -95,12 +95,25 @@ IOC_PAYLOAD_NAMES = [
 # Exploit-request fingerprint for web-server logs.
 # IMPORTANT: `__passthru` and `route=` are LEGITIMATE REDCap parameters --
 # External Modules route through __passthru (e.g.
-# `__passthru=ExternalModules&prefix=legacy_url_fixer&ajax=1`) and
-# DataImportController is a real authenticated controller. Matching either
-# substring alone produces false positives, so _exploit_log_reasons() below
-# matches only the specific malicious combination / obfuscation, never the
-# bare parameter names.
+# `__passthru=ExternalModules&prefix=legacy_url_fixer&ajax=1`) and normal survey
+# traffic uses a plain `__passthru=index.php&route=PdfController:index` to reach
+# benign controllers. Matching either substring alone produces false positives,
+# so _classify_log_line() below matches only the malicious combinations:
+#
+#   1. DataImportController reached via __passthru -- the report's RCE sink.
+#      Always flagged, at any encoding.
+#   2. ANY internal <name>Controller reached via a __passthru whose `index.php`
+#      was DOUBLE-ENCODED (e.g. %2569ndex.php). This is the campaign's real
+#      generalizable signature: legitimate clients send a plain, literal
+#      `index.php`, never a double-encoded one, so the obfuscation -- not the
+#      controller name, not the HTTP status -- is what distinguishes the attack.
+#      (Observed in the wild reaching ParcelController:show, which the old
+#      DataImportController-only rule missed and caught only by source IP.)
+#
+# Never match the bare parameter names.
 IOC_ATTACKER_SURVEY_HASH = "s=NXCJMDCWXE"   # specific hash from the report sample
+# Extract the internal controller a request routes to (for reporting).
+INTERNAL_CONTROLLER_RE = re.compile(r"route=([a-z0-9_]+controller)\b", re.IGNORECASE)
 
 # Patched releases and affected floor (public threat-intel; confirm vs. vendor).
 FIXED_VERSIONS = {
@@ -336,6 +349,32 @@ def parse_apache_time(line: str):
         return None
 
 
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+# status + size immediately after the quoted "..request.." in CLF/combined logs.
+_STATUS_SIZE_RE = re.compile(r'"\s+(\d{3})\s+(\d+|-)')
+
+
+def _parse_clf_fields(line: str):
+    """Best-effort extract (client_ip, status, size) from an access-log line.
+
+    Handles both the plain CLF shape (`IP - - [ts] "req" status size`) and the
+    vhost-prefixed shape (`host:port IP - - [ts] ...`) seen on the target host,
+    by taking the last IPv4 token appearing before the `[timestamp]`. Returns
+    None for any field that cannot be parsed; never raises. size may be None
+    when the server logged `-`."""
+    ip = status = size = None
+    m_ts = _APACHE_TS_RE.search(line)
+    prefix = line[:m_ts.start()] if m_ts else line
+    ips = _IPV4_RE.findall(prefix)
+    if ips:
+        ip = ips[-1]                       # client IP sits just before the [ts]
+    m = _STATUS_SIZE_RE.search(line)
+    if m:
+        status = m.group(1)
+        size = None if m.group(2) == "-" else int(m.group(2))
+    return (ip, status, size)
+
+
 def detect_mitigation_date(redcap_root: str):
     """Infer the date the host became patched from the install mtime of the
     EARLIEST patched redcap_vX.Y.Z directory (that is the moment the host first
@@ -391,19 +430,39 @@ def _classify_log_line(line: str) -> tuple:
 
     Returns (exploit_reasons, recon_reasons).
 
-    The developer-confirmed HALLMARK of the attack is reaching the internal
-    DataImportController through the unauthenticated survey `__passthru`.
-    Normal REDCap survey traffic *also* uses `__passthru=index.php` to reach
-    benign controllers (PdfController, SendItController, ...), so neither
-    `__passthru` nor `index.php` is an indicator on its own, and we never match
-    on them. We decode the line first so an attacker URL-encoding the route
-    (e.g. %2569ndex.php) is still caught by the DataImportController test."""
-    exploit, recon = [], []
-    decoded = _url_unquote_recursive(line).lower()
+    Two malicious patterns are flagged as exploit-shaped (see the IOC block):
 
-    # Hallmark: survey passthru reaching the data-import controller.
-    if "__passthru" in decoded and "route=dataimportcontroller" in decoded:
-        exploit.append("survey __passthru -> DataImportController (attack hallmark)")
+      1. DataImportController reached via the unauthenticated survey `__passthru`
+         -- the report's RCE sink. Flagged at any encoding.
+      2. ANY internal <name>Controller reached via a `__passthru` whose
+         `index.php` was DOUBLE-ENCODED (e.g. %2569ndex.php). Legitimate survey
+         traffic sends a plain, literal `index.php`, so the double-encoding is
+         the campaign signature that generalizes beyond one controller name.
+
+    Normal REDCap survey traffic also uses `__passthru=index.php` to reach benign
+    controllers (PdfController, SendItController, ExternalModules, ...), so
+    neither `__passthru` nor `index.php` nor `route=` is an indicator on its own
+    and we never match on them alone."""
+    exploit, recon = [], []
+    once = urllib.parse.unquote(line).lower()       # single decode round
+    full = _url_unquote_recursive(line).lower()     # full (defeats double-encode)
+
+    has_passthru = "__passthru" in full
+    # (1) DataImportController -- the RCE sink -- at any encoding.
+    if has_passthru and "route=dataimportcontroller" in full:
+        exploit.append("survey __passthru -> DataImportController (RCE sink)")
+    # (2) Double-encoded __passthru -> any internal controller.
+    #     Obfuscation test: `index.php` is present only after the FULL decode,
+    #     i.e. it was not literal after a single round (so it was multiply
+    #     encoded, as in %2569ndex.php). Plain single-encoded/legit traffic has
+    #     `index.php` already present once-decoded and is not matched here.
+    if has_passthru and "index.php" in full and "index.php" not in once:
+        m = INTERNAL_CONTROLLER_RE.search(full)
+        ctrl = m.group(1) if m else "an internal controller"
+        if ctrl.lower() != "dataimportcontroller":   # avoid duplicate reason
+            exploit.append(
+                f"obfuscated survey __passthru -> {ctrl} "
+                "(double-encoded index.php)")
     # Exact attacker survey hash from the report sample.
     if IOC_ATTACKER_SURVEY_HASH.lower() in line.lower():
         exploit.append(f"attacker survey hash {IOC_ATTACKER_SURVEY_HASH}")
@@ -797,6 +856,7 @@ def check_access_logs(rep: Report, log_dirs: list, mitigation_date=None,
     before = on = after = undated = 0        # attack timing vs mitigation_date
     earliest = latest = None
     unreadable = 0
+    by_ip = {}                               # per-source-IP behaviour aggregate
     for path in files:
         fh = open_maybe_gzip(path)
         if fh is None:
@@ -823,18 +883,55 @@ def check_access_logs(rep: Report, log_dirs: list, mitigation_date=None,
                         on += 1
                     else:
                         after += 1
+
+                ip, status, size = _parse_clf_fields(line)
+                agg = by_ip.setdefault(ip, {
+                    "exploit": 0, "recon": 0, "controllers": set(),
+                    "statuses": {}, "doubled_path_404": 0,
+                    "first": tstr, "last": tstr})
+                agg["last"] = tstr
+                if status:
+                    agg["statuses"][status] = agg["statuses"].get(status, 0) + 1
+                if ("surveys/redcap/surveys" in line or
+                        "surveys/surveys" in line) and status == "404":
+                    agg["doubled_path_404"] += 1
+
                 if ex:
                     exploit_total += 1
+                    agg["exploit"] += 1
+                    m = INTERNAL_CONTROLLER_RE.search(_url_unquote_recursive(line))
+                    if m:
+                        agg["controllers"].add(m.group(1))
+                    # Rank by status/size: a 2xx means the passthru actually
+                    # routed to the controller (technique worked); anything else
+                    # is an attempt that did not route.
+                    if status and status.startswith("2"):
+                        rank = ("passthru routed to internal controller -- "
+                                "technique succeeded (impact depends on the "
+                                "controller)")
+                    elif status:
+                        rank = f"attempt -- did not route (HTTP {status})"
+                    else:
+                        rank = "attempt (status not parseable)"
                     if unlimited or len(exploit_ev) < max_matches:
-                        exploit_ev.append(f"{path} [{tstr}]: [{'; '.join(ex + rc)}] {line.strip()}")
+                        exploit_ev.append(
+                            f"{path} [{tstr}]: [{'; '.join(ex + rc)}] "
+                            f"[{rank}] {line.strip()}")
                 else:
                     recon_total += 1
+                    agg["recon"] += 1
                     if unlimited or len(recon_ev) < max_matches:
                         recon_ev.append(f"{path} [{tstr}]: [{'; '.join(rc)}] {line.strip()}")
         except Exception:
             unreadable += 1
         finally:
             fh.close()
+
+    # Distinct source IPs that issued exploit-shaped requests (the "other
+    # attackers" surfaced by pattern, not by the known IOC IP).
+    exploit_ips = sorted(ip for ip, a in by_ip.items()
+                         if ip and a["exploit"] > 0)
+    other_ips = [ip for ip in exploit_ips if ip != IOC_SOURCE_IP]
 
     total = exploit_total + recon_total
     if total:
@@ -848,6 +945,19 @@ def check_access_logs(rep: Report, log_dirs: list, mitigation_date=None,
             "undated": undated,
             "earliest": earliest.isoformat() if earliest else None,
             "latest": latest.isoformat() if latest else None,
+            "distinct_exploit_ips": exploit_ips,
+            "by_ip": {
+                ip: {
+                    "exploit": a["exploit"],
+                    "recon": a["recon"],
+                    "controllers": sorted(a["controllers"]),
+                    "statuses": a["statuses"],
+                    "doubled_path_404": a["doubled_path_404"],
+                    "first": a["first"],
+                    "last": a["last"],
+                }
+                for ip, a in by_ip.items() if ip and a["exploit"] > 0
+            },
         }
 
     if not unlimited and exploit_total > max_matches:
@@ -858,14 +968,25 @@ def check_access_logs(rep: Report, log_dirs: list, mitigation_date=None,
                         "attacker IP; pass --max-log-matches all to list every one)")
 
     if exploit_ev:
+        detail = ("Request(s) reaching an internal controller via the "
+                  "unauthenticated survey __passthru -- either DataImportController "
+                  "(the report's RCE sink) or any controller reached through a "
+                  "double-encoded index.php (the campaign's generalizable "
+                  "signature), or using the known attacker survey hash. This is an "
+                  "exploitation ATTEMPT in the logs -- a 2xx means the passthru "
+                  "routed to the controller (technique worked), but the host-state "
+                  "checks above (web shell, miner, persistence) are what confirm an "
+                  "actual compromise.")
+        if len(exploit_ips) > 1 or (exploit_ips and exploit_ips[0] != IOC_SOURCE_IP):
+            detail += (f" Distinct source IP(s) issuing exploit-shaped requests: "
+                       f"{', '.join(exploit_ips)}.")
+        if other_ips:
+            detail += (f" NOTE: {len(other_ips)} source IP(s) beyond the documented "
+                       f"IOC ({IOC_SOURCE_IP}) issued exploit-shaped requests: "
+                       f"{', '.join(other_ips)}.")
         rep.add(Finding(SEV_HIGH, "weblog",
                         "CVE-2026-90817 exploit-attempt signature in access logs",
-                        "Request(s) reaching DataImportController via the survey "
-                        "__passthru (the attack's hallmark) or using the known attacker "
-                        "survey hash. This is an exploitation ATTEMPT in the logs -- it "
-                        "is not by itself proof of success; the host-state checks above "
-                        "(web shell, miner, persistence) are what confirm compromise.",
-                        evidence=exploit_ev))
+                        detail, evidence=exploit_ev))
     if recon_ev:
         rep.add(Finding(SEV_MEDIUM, "weblog",
                         f"Traffic from the known attacker source IP ({IOC_SOURCE_IP})",
@@ -975,6 +1096,20 @@ def render_text(rep: Report, args) -> str:
                        f"undated {s['undated']}")
         if s["earliest"]:
             out.append(f"  observed window:  {s['earliest']}  ..  {s['latest']}")
+        by_ip = s.get("by_ip") or {}
+        if by_ip and not args.quiet:
+            out.append("  source IPs issuing exploit-shaped requests:")
+            for ip in s.get("distinct_exploit_ips", []):
+                a = by_ip.get(ip)
+                if not a:
+                    continue
+                ctrls = ", ".join(a["controllers"]) or "-"
+                sts = ", ".join(f"{k}x{v}" for k, v in sorted(a["statuses"].items()))
+                extra = (f", doubled-path 404s={a['doubled_path_404']}"
+                         if a["doubled_path_404"] else "")
+                flag = "  <-- NOT the documented IOC IP" if ip != IOC_SOURCE_IP else ""
+                out.append(f"    {ip}  exploit={a['exploit']}  "
+                           f"controllers=[{ctrls}]  status=[{sts}]{extra}{flag}")
         out.append("")
 
     actionable = [f for f in rep.findings if f.severity not in (SEV_OK,)]
