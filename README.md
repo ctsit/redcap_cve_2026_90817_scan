@@ -27,14 +27,19 @@ It is intended for an administrator running it against **their own** REDCap serv
 
 ## Requirements
 
-- Python 3.7+. **Standard library only** — no `pip` installs.
-- Runs on **Debian- and RHEL-family** Linux. Apache logs are auto-scanned at
-  `/var/log/apache2` (Debian) or `/var/log/httpd` (RHEL/CentOS/Rocky/Alma), and
-  nginx at `/var/log/nginx`. On RHEL 8 the system `python3` is 3.6, so invoke
-  `python3.9` (or newer) there; RHEL/Rocky/Alma 9 ship 3.9+.
-- Run as **root** for a complete scan (per-user crontabs, other users'
-  `authorized_keys` and `/proc/<pid>/exe`, and some logs are otherwise unreadable).
-  Without root it still runs and clearly marks the result as a partial scan.
+- Python 3.7+. **Standard library only** — no `pip` installs. A single file; copy
+  it to the host and run.
+- **Linux** (Debian- and RHEL-family): fully supported. Apache logs are
+  auto-scanned at `/var/log/apache2` (Debian) or `/var/log/httpd`
+  (RHEL/CentOS/Rocky/Alma), and nginx at `/var/log/nginx`. On RHEL 8 the system
+  `python3` is 3.6, so invoke `python3.9` (or newer) there; RHEL/Rocky/Alma 9
+  ship 3.9+. Run as **root** for a complete scan (per-user crontabs, other users'
+  `authorized_keys` and `/proc/<pid>/exe`, and some logs are otherwise
+  unreadable). Without root it still runs and clearly marks the result as a
+  partial scan.
+- **Windows** (REDCap on IIS or Apache/XAMPP): **best-effort** — see
+  [Platforms & Windows support](#platforms--windows-support). Run from an
+  **elevated** PowerShell/cmd for a complete scan.
 
 ## Usage
 
@@ -52,6 +57,14 @@ sudo python3 -I redcap_cve_2026_90817_scan.py \
 sudo python3 -I redcap_cve_2026_90817_scan.py --json
 ```
 
+On **Windows**, run from an elevated prompt and point `--redcap-root` at the
+install (platform and default log dirs are auto-detected):
+
+```powershell
+# IIS or Apache/XAMPP; logs under C:\inetpub\logs\LogFiles or the Apache logs dir
+python -I redcap_cve_2026_90817_scan.py --redcap-root C:\redcap --json
+```
+
 `-I` runs Python in isolated mode (ignores `$PYTHONPATH` and the CWD) — good hygiene
 when scanning a possibly-tampered host.
 
@@ -60,8 +73,9 @@ when scanning a possibly-tampered host.
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `--redcap-root PATH` | `/var/www/html/redcap` | REDCap install root. |
-| `--log-dir DIR` (repeatable) | `/var/log/apache2`, `/var/log/httpd`, `/var/log/nginx` | Web-server log directories to scan (handles rotated `.gz`). |
-| `--home-dir DIR` (repeatable) | `/root` + each `/home/*` | Extra home dirs to scan for SSH keys / shell rc files. |
+| `--log-dir DIR` (repeatable) | *platform-specific* (Apache/nginx on Linux; IIS `LogFiles` + Apache on Windows) | Web-server log directories to scan (handles rotated `.gz` and IIS W3C logs). |
+| `--home-dir DIR` (repeatable) | `/root` + each `/home/*` (Linux); each `C:\Users\*` (Windows) | Extra home dirs to scan for SSH keys / shell/profile files. |
+| `--platform auto`\|`linux`\|`windows` | `auto` | Host platform to assume. Auto-detects from the OS; force it to select a provider (OS-specific host probes still run only on the matching live OS). |
 | `--mitigation-date YYYY-MM-DD` | *auto-detected* | Date the vulnerability was closed by upgrading. See [Attack timing](#attack-timing). |
 | `--full-hash-scan` | off | Recursively hash files under `temp/cache` and staging dirs (slower). |
 | `--max-log-matches N` \| `all` | `100` | How many attack log entries to list per category, kept **verbatim**. |
@@ -74,7 +88,7 @@ when scanning a possibly-tampered host.
 |------|---------|
 | `0` | Clean and patched, and the scan completed fully. |
 | `1` | One or more findings (vulnerable version and/or IOC/attack) — investigate. |
-| `2` | Scan could not be completed fully (errors, or non-root and otherwise clean — a clean result could not be fully asserted). |
+| `2` | Scan could not be completed fully (errors, or unprivileged and otherwise clean — a clean result could not be fully asserted). |
 
 ## What it checks
 
@@ -160,11 +174,60 @@ persistence) always force `LIKELY COMPROMISED` regardless of timing.
   checks are what confirm an actual breach.
 - The LTS-vs-Standard version boundaries are drawn from public threat-intel;
   confirm the exact fixed release against the REDCap vendor release notes.
-- The log timestamp parser expects the standard Apache CLF format
-  `[dd/Mon/yyyy:HH:MM:SS ±zzzz]`. Attacks in a customized `LogFormat` are counted as
-  "undated" and flagged for manual review rather than silently dropped.
+- The log timestamp parser expects the standard Apache CLF/Combined format
+  `[dd/Mon/yyyy:HH:MM:SS ±zzzz]`. **IIS W3C Extended logs** are supported too:
+  each W3C row is converted to the combined-log shape (reading the `#Fields:`
+  header for column positions) and fed through the *same* classifier, so the
+  attack signatures are identical across Apache and IIS. Attacks in a customized
+  `LogFormat` with an unparseable timestamp are counted as "undated" and flagged
+  for manual review rather than silently dropped.
 - IOC definitions live in one clearly-marked constants block at the top of the
   script — update them there if the vendor publishes more indicators.
+
+## Platforms & Windows support
+
+Host-OS access (processes, sockets, scheduled jobs, keys, profiles, staging
+dirs, log locations) is abstracted behind a small `HostProvider` seam, so the
+same tool serves Linux and Windows and the **vulnerability** and
+**exploit-attempt** detection — which live entirely in REDCap's PHP and the
+web-server logs — is byte-for-byte identical on both.
+
+- **Linux** — fully supported and matches the **documented** Unit 42 campaign
+  IOCs (ELF XMRig miner, `syslog-ng-<hash>` masquerade, Monero wallet on a
+  command line, cron persistence, SSH backdoor key).
+- **Windows** — **best-effort and not yet validated on real hardware.** The
+  documented campaign is Linux-only, so a Windows REDCap host exploited through
+  the *same* CVE would almost certainly get a *different* post-exploitation
+  payload. Accordingly:
+  - The **"am I vulnerable?"** (version) and **"am I being attacked?"**
+    (web-log signature, including IIS W3C logs) answers are **first-class** and
+    shared with Linux.
+  - The **"am I compromised?"** host-state checks are **PROVISIONAL / generic
+    heuristics** (a miner process or its `:50001` local API listener, a
+    Scheduled Task running a PowerShell/`certutil` download cradle, a new admin
+    SSH key, executables staged in Windows temp dirs, a system image running
+    from outside `System32`) rather than the exact documented artifacts. The
+    text report prints a note to this effect, and the Windows provider uses
+    stdlib only (`subprocess` to `tasklist`/`netstat`/`schtasks`/`reg` and
+    Task-Scheduler XML reads — no third-party WMI libraries).
+
+Help validating the Windows path on a live instance is welcome — see the test
+harness below.
+
+## Development / tests
+
+`tests/` holds a stdlib `unittest` suite (no `pip`) with recorded log fixtures
+and a `FakeProvider` that injects host facts, so **either platform can be tested
+on any OS with no live host**: the Linux path (and the shared version/log/verdict
+logic) can be regression-tested with no Windows box, and the Windows provider /
+IOC logic can be unit-tested against fixtures with no live compromised host.
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+`tests/fixtures/logs/` contains the same attack expressed as both Apache CLF and
+IIS W3C logs; a test asserts the two produce an identical attack summary.
 
 ## License
 

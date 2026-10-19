@@ -1,0 +1,8 @@
+#Software: Microsoft Internet Information Services 10.0
+#Version: 1.0
+#Date: 2026-10-02 00:48:49
+#Fields: date time c-ip cs-method cs-uri-stem cs-uri-query sc-status cs(User-Agent)
+2026-10-02 00:48:49 10.0.0.5 GET /redcap/surveys/ s=ABCDEF&__passthru=index.php&route=PdfController:index 200 Mozilla/5.0
+2026-10-02 01:00:00 202.61.130.221 GET /redcap/surveys/ s=NXCJMDCWXE&__passthru=index.php&route=DataImportController:index 404 curl/8.0
+2026-10-03 02:10:10 203.0.113.9 GET /redcap/surveys/ s=ZZZZ&__passthru=%2569ndex.php&route=ParcelController:show 200 python-requests/2.31
+2026-10-04 03:00:00 202.61.130.221 GET /redcap/ - 200 Mozilla/5.0

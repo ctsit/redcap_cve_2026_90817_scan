@@ -33,11 +33,39 @@ answer two questions:
 
 It NEVER sends HTTP requests, NEVER reproduces the exploit or any payload, and
 NEVER modifies, quarantines, or removes anything. It only reads files,
-processes, sockets, and logs. Run as root for a complete scan; it degrades
-gracefully (and says so) without privileges.
+processes, sockets, and logs. Run as root (Linux) or an elevated Administrator
+(Windows) for a complete scan; it degrades gracefully (and says so) without
+privileges.
 
-Stdlib only. Python 3.7+. Runs on Debian- and RHEL-family Linux
-(Apache logs at /var/log/apache2 or /var/log/httpd are auto-detected).
+Stdlib only. Python 3.7+.
+
+Platforms
+---------
+  * Linux  (Debian- and RHEL-family): fully supported, matches the documented
+    Unit 42 campaign IOCs. Apache logs at /var/log/apache2 or /var/log/httpd and
+    nginx at /var/log/nginx are auto-detected.
+  * Windows (REDCap on IIS or Apache/XAMPP): BEST-EFFORT, see the WINDOWS
+    SUPPORT note below. The host OS primitives are abstracted behind a
+    HostProvider so the vulnerability/exploit-attempt detection (which lives
+    entirely in REDCap's PHP and the web-server logs) is identical on both.
+
+WINDOWS SUPPORT (read this before trusting a Windows "compromised" verdict)
+--------------------------------------------------------------------------
+The documented Unit 42 campaign is Linux-only: an ELF XMRig miner, a
+`syslog-ng-<hash>` exec masquerade, a Monero wallet on a process command line,
+cron persistence, and an SSH backdoor key. A Windows REDCap host exploited
+through the SAME CVE would almost certainly be given a DIFFERENT post-
+exploitation payload (a Windows miner, Run-key / Scheduled-Task persistence,
+etc.). So on Windows:
+
+  * The "am I vulnerable?" and "am I being attacked?" answers (version + web-log
+    signature) are first-class and fully shared with Linux.
+  * The "am I compromised?" host-state checks are PROVISIONAL / lower-confidence.
+    They look for GENERIC post-exploitation (a miner process or its local API
+    listener, a scheduled task pulling a remote script, a new admin SSH key,
+    executables staged in temp dirs) rather than the exact documented artifacts,
+    and the Windows provider itself has not been validated on real hardware yet.
+    Findings are labeled accordingly; confirm manually before acting.
 
 Usage:
     sudo python3 -I redcap_cve_2026_90817_scan.py [--redcap-root PATH] [--json]
@@ -45,7 +73,7 @@ Usage:
 Exit codes:
     0  clean and patched (and scan was complete)
     1  one or more findings (vulnerable version and/or IOC) -- investigate
-    2  scan could not be completed fully (errors, or non-root and otherwise
+    2  scan could not be completed fully (errors, or unprivileged and otherwise
        clean -- a clean result could not be fully asserted)
 """
 
@@ -61,14 +89,17 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import urllib.parse
 from dataclasses import dataclass, field, asdict
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Tuple
 
 # --------------------------------------------------------------------------- #
 # IOC constants -- single source of truth (from the Unit 42 report).
 # Update here if the vendor/threat-intel publishes more indicators.
+# These are platform-independent facts about the campaign; where an IOC is
+# Linux-specific (a path, an ELF, a Linux TTP) the platform provider owns it.
 # --------------------------------------------------------------------------- #
 
 IOC_SOURCE_IP = "202.61.130.221"            # exploit source
@@ -95,6 +126,12 @@ IOC_PAYLOAD_NAMES = [
     "banner-ver2_800x800.jpg",
     "grepb2.jpg",
 ]
+# Process command-line / name tokens that indicate the miner itself. These are
+# cross-platform: the pool domain, wallet, and the XMRig/stratum strings would
+# reappear on a Windows miner too, so we match them regardless of OS.
+MINER_CMD_TOKENS = ("xmrig", "c3pool", "stratum+tcp", IOC_POOL_DOMAIN.lower(),
+                    IOC_MONERO_WALLET.lower())
+
 # Exploit-request fingerprint for web-server logs.
 # IMPORTANT: `__passthru` and `route=` are LEGITIMATE REDCap parameters --
 # External Modules route through __passthru (e.g.
@@ -127,15 +164,24 @@ FIXED_VERSIONS = {
 AFFECTED_FLOOR = (13, 3, 0)
 TOP_STANDARD_FIX = (17, 4, 4)
 
-# Suspicious staging locations commonly abused by the campaign.
-STAGING_DIRS = ["/var/tmp", "/dev/shm", "/tmp"]
-EXEC_FROM_DIRS = ("/var/tmp", "/dev/shm", "/tmp")
-
-# Patterns indicating a fetch-to-shell cradle in cron / profile files.
+# Patterns indicating a fetch-to-shell cradle in cron / profile / task files.
+# Linux shell cradles.
 FETCH_TO_SHELL_RE = re.compile(
     r"(curl|wget)\b[^\n|]*\|\s*(bash|sh)\b"
     r"|base64\s+(-d|--decode)\b[^\n|]*\|\s*(bash|sh)\b"
     r"|\beval\b.*\$\(.*(curl|wget)",
+    re.IGNORECASE,
+)
+# Windows PowerShell / cmd download cradles (provisional). Covers
+# `IEX (New-Object Net.WebClient).DownloadString(...)`, `iwr ... | iex`,
+# `Invoke-WebRequest ... -OutFile`, `curl/certutil -urlcache`, base64 -enc, etc.
+WIN_FETCH_TO_SHELL_RE = re.compile(
+    r"(New-Object\s+Net\.WebClient)"
+    r"|DownloadString|DownloadFile|DownloadData"
+    r"|(Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b[^\n|]*(\|\s*(iex|Invoke-Expression)|-OutFile)"
+    r"|\b(iex|Invoke-Expression)\b"
+    r"|certutil(\.exe)?\s+[^\n]*-urlcache"
+    r"|-enc(odedcommand)?\b",
     re.IGNORECASE,
 )
 
@@ -186,6 +232,8 @@ class Report:
     mitigation_date: Optional[str] = None   # ISO date the host became patched
     mitigation_source: str = ""              # how that date was determined
     attack_summary: Optional[dict] = None    # log-attack counts / timing
+    privileged: bool = False                 # provider-reported privilege level
+    platform_name: str = ""                  # active provider (linux/windows/...)
 
     def add(self, f: Finding) -> None:
         self.findings.append(f)
@@ -200,6 +248,34 @@ class Report:
 
     def has_at_least(self, sev: str) -> bool:
         return self.max_rank() >= _SEV_RANK[sev]
+
+
+# --------------------------------------------------------------------------- #
+# Host-fact value types yielded by a HostProvider
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class ProcInfo:
+    pid: str
+    comm: str = ""          # short process/image name
+    cmdline: str = ""       # full command line (space-joined)
+    exe: str = ""           # resolved executable path, if known
+
+
+@dataclass
+class SockInfo:
+    proto: str              # "tcp" / "tcp6"
+    laddr: str              # local host (dotted/bracketless)
+    lport: int
+    raddr: str              # remote host
+    rport: int
+    state: str              # normalized: "LISTEN", "ESTAB", ... (provider-normalized)
+
+
+@dataclass
+class JobInfo:
+    source: str             # label: cron file path or scheduled-task name
+    lines: list = field(default_factory=list)   # text lines to scan
 
 
 # --------------------------------------------------------------------------- #
@@ -269,18 +345,19 @@ def mtime_str(path: str) -> str:
         return "?"
 
 
-def iter_proc_net(path: str) -> Iterable[dict]:
-    """Yield parsed rows from /proc/net/tcp or /proc/net/tcp6."""
-    lines = read_lines(path)
-    for line in lines[1:]:          # skip header
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        yield {
-            "local": parts[1],
-            "remote": parts[2],
-            "state": parts[3],
-        }
+def _run(cmd: list, timeout: int = 20) -> Optional[str]:
+    """Run a read-only host command and return stdout text, or None on any
+    failure. Used only by the Windows provider to query the OS (tasklist,
+    netstat, reg, schtasks). Never raises."""
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        return proc.stdout.decode("utf-8", "replace")
+    except Exception:
+        return None
 
 
 def _hex_ipv4(h: str) -> str:
@@ -308,17 +385,6 @@ def parse_procnet_addr(addr: str) -> tuple:
             return (_hex_ipv4(tail), port)
         return ("ipv6:" + host_hex, port)
     return (host_hex, port)
-
-
-def list_home_dirs(extra: list) -> list:
-    homes = []
-    if os.path.isdir("/root"):
-        homes.append("/root")
-    homes.extend(sorted(glob.glob("/home/*")))
-    for d in extra or []:
-        if d not in homes:
-            homes.append(d)
-    return [h for h in homes if os.path.isdir(h)]
 
 
 def parse_version(s: str) -> Optional[tuple]:
@@ -376,6 +442,118 @@ def _parse_clf_fields(line: str):
         status = m.group(1)
         size = None if m.group(2) == "-" else int(m.group(2))
     return (ip, status, size)
+
+
+# --------------------------------------------------------------------------- #
+# W3C Extended log format (IIS) -> synthetic CLF adapter
+# --------------------------------------------------------------------------- #
+#
+# IIS logs in W3C Extended format: '#'-prefixed directives (including a
+# `#Fields:` line that names the columns) followed by space-delimited data rows
+# with UTC timestamps. Rather than re-implement classification/timing/aggregation
+# for a second format, we convert each W3C row into a synthetic CLF/combined line
+# carrying the SAME information (client IP, full decoded request with query
+# string, status, a bracketed timestamp) and feed it through the existing
+# _classify_log_line / parse_apache_time / _parse_clf_fields pipeline unchanged.
+# That keeps the attack signature logic single-sourced across Apache and IIS.
+
+_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _w3c_to_clf(fields: list, row: list) -> Optional[str]:
+    """Build a synthetic combined-log line from a W3C field map + data row.
+    Returns None if the essential columns are absent."""
+    idx = {name.lower(): i for i, name in enumerate(fields)}
+
+    def get(col):
+        i = idx.get(col)
+        if i is None or i >= len(row):
+            return None
+        val = row[i]
+        return None if val == "-" else val
+
+    ip = get("c-ip") or "-"
+    method = get("cs-method") or "GET"
+    stem = get("cs-uri-stem") or "/"
+    query = get("cs-uri-query")
+    status = get("sc-status") or "-"
+    ua = get("cs(user-agent)") or "-"
+    uri = stem if not query else f"{stem}?{query}"
+
+    # Timestamp: W3C logs date + time as UTC (e.g. 2026-10-07 / 12:34:56).
+    date = get("date")
+    time = get("time")
+    ts = ""
+    if date and time:
+        try:
+            y, mo, d = (int(x) for x in date.split("-"))
+            ts = f"[{d:02d}/{_MONTHS[mo - 1]}/{y:04d}:{time} +0000]"
+        except (ValueError, IndexError):
+            ts = ""
+    # Mirror the combined-log shape _parse_clf_fields/_classify_log_line expect:
+    #   IP - - [ts] "METHOD uri HTTP/1.1" status - "-" "UA"
+    size = "-"
+    return f'{ip} - - {ts} "{method} {uri} HTTP/1.1" {status} {size} "-" "{ua}"'
+
+
+def _is_w3c_log(first_lines: list) -> bool:
+    for ln in first_lines:
+        s = ln.lstrip("\ufeff").strip()
+        if s.startswith("#Fields:") or s.startswith("#Software: Microsoft Internet"):
+            return True
+        if s and not s.startswith("#"):
+            return False      # first data line without a W3C directive -> not W3C
+    return False
+
+
+def iter_clf_lines(path: str) -> Iterable[str]:
+    """Yield combined-log-shaped lines from an access log, transparently
+    converting IIS W3C Extended logs to the CLF shape. Apache/nginx CLF lines
+    pass through verbatim. Never raises; silently yields nothing on failure."""
+    fh = open_maybe_gzip(path)
+    if fh is None:
+        raise OSError("unreadable")       # caller counts this as unreadable
+    try:
+        # Peek enough header lines to classify the format.
+        head = []
+        for ln in fh:
+            head.append(ln)
+            if len(head) >= 20:
+                break
+        w3c = _is_w3c_log(head)
+        if not w3c:
+            for ln in head:
+                yield ln
+            for ln in fh:
+                yield ln
+            return
+        # W3C: track the active #Fields: directive; convert data rows.
+        fields = []
+        for ln in _chain(head, fh):
+            s = ln.lstrip("\ufeff")
+            st = s.strip()
+            if not st:
+                continue
+            if st.startswith("#"):
+                if st[1:].lstrip().lower().startswith("fields:"):
+                    after = st.split(":", 1)[1] if ":" in st else ""
+                    fields = after.split()
+                continue
+            if not fields:
+                continue
+            row = st.split()
+            syn = _w3c_to_clf(fields, row)
+            if syn is not None:
+                yield syn
+    finally:
+        fh.close()
+
+
+def _chain(*iters):
+    for it in iters:
+        for x in it:
+            yield x
 
 
 def detect_mitigation_date(redcap_root: str):
@@ -445,7 +623,11 @@ def _classify_log_line(line: str) -> tuple:
     Normal REDCap survey traffic also uses `__passthru=index.php` to reach benign
     controllers (PdfController, SendItController, ExternalModules, ...), so
     neither `__passthru` nor `index.php` nor `route=` is an indicator on its own
-    and we never match on them alone."""
+    and we never match on them alone.
+
+    This function is web-server- and OS-agnostic: it reads only the request URL,
+    so Apache (Linux or Windows) and IIS (via the W3C->CLF adapter) are handled
+    identically."""
     exploit, recon = [], []
     once = urllib.parse.unquote(line).lower()       # single decode round
     full = _url_unquote_recursive(line).lower()     # full (defeats double-encode)
@@ -477,8 +659,515 @@ def _classify_log_line(line: str) -> tuple:
     return (_dedup(exploit), _dedup(recon))
 
 
+def _line_is_suspicious(line: str, extra_res: Iterable) -> bool:
+    """True if a cron/profile/task line matches a fetch-to-shell cradle (the
+    provider supplies the platform-appropriate regex[es]) or references a known
+    cross-platform IOC (pool domain, source IP, payload filename)."""
+    low = line.lower()
+    for rx in extra_res:
+        if rx.search(line):
+            return True
+    if IOC_POOL_DOMAIN in low or IOC_SOURCE_IP in line:
+        return True
+    if any(name in low for name in (n.lower() for n in IOC_PAYLOAD_NAMES)):
+        return True
+    return False
+
+
 # --------------------------------------------------------------------------- #
-# Checks
+# Host providers: everything OS-specific lives behind this seam.
+# The checks below consume only HostProvider methods, so adding an OS is a
+# matter of adding a provider, never touching the detection logic.
+# --------------------------------------------------------------------------- #
+
+class HostProvider:
+    """Read-only, exception-safe access to OS-specific host facts.
+
+    The base class is a safe, empty default: every method returns nothing and
+    is_privileged() is False. Concrete providers override what they can.
+    """
+    name = "base"
+    #: whether this provider's host-state IOCs match the documented campaign
+    #: (Linux) or are provisional/generic heuristics (Windows).
+    host_state_confidence = "provisional"
+
+    # ---- privilege / locations -------------------------------------------- #
+    def is_privileged(self) -> bool:
+        return False
+
+    def staging_dirs(self) -> list:
+        return []
+
+    def exec_from_dirs(self) -> tuple:
+        return tuple(self.staging_dirs())
+
+    def home_dirs(self, extra) -> list:
+        homes = []
+        for d in extra or []:
+            if d not in homes:
+                homes.append(d)
+        return [h for h in homes if os.path.isdir(h)]
+
+    def default_log_dirs(self) -> list:
+        return []
+
+    def log_globs(self) -> list:
+        return ["*access*", "*access*.gz"]
+
+    # ---- fetch-to-shell dialect ------------------------------------------- #
+    def fetch_to_shell_res(self) -> list:
+        return [FETCH_TO_SHELL_RE]
+
+    # ---- host-state fact sources (override as supported) ------------------ #
+    def iter_processes(self) -> Iterable[ProcInfo]:
+        return []
+
+    def iter_sockets(self) -> Iterable[SockInfo]:
+        return []
+
+    def iter_scheduled_jobs(self) -> Iterable[JobInfo]:
+        return []
+
+    def iter_authorized_keys(self, homes) -> Iterable[Tuple[str, list]]:
+        return []
+
+    def iter_persistence_rc(self, homes) -> Iterable[Tuple[str, list]]:
+        return []
+
+    def history_suppression(self, homes) -> list:
+        """Return evidence strings for shell/console history tampering."""
+        return []
+
+    def masquerade_findings(self, procs) -> list:
+        """Return evidence strings for processes masquerading as system daemons.
+        Campaign-specific on Linux; a generic heuristic on Windows."""
+        return []
+
+    def can_enumerate_processes(self) -> bool:
+        return False
+
+    def can_enumerate_sockets(self) -> bool:
+        return False
+
+
+class LinuxHostProvider(HostProvider):
+    """Debian- and RHEL-family Linux. Matches the documented Unit 42 campaign."""
+    name = "linux"
+    host_state_confidence = "documented"
+
+    _STAGING = ["/var/tmp", "/dev/shm", "/tmp"]
+
+    def is_privileged(self) -> bool:
+        return is_root()
+
+    def staging_dirs(self) -> list:
+        return list(self._STAGING)
+
+    def exec_from_dirs(self) -> tuple:
+        return ("/var/tmp", "/dev/shm", "/tmp")
+
+    def home_dirs(self, extra) -> list:
+        homes = []
+        if os.path.isdir("/root"):
+            homes.append("/root")
+        homes.extend(sorted(glob.glob("/home/*")))
+        for d in extra or []:
+            if d not in homes:
+                homes.append(d)
+        return [h for h in homes if os.path.isdir(h)]
+
+    def default_log_dirs(self) -> list:
+        return ["/var/log/apache2", "/var/log/httpd", "/var/log/nginx"]
+
+    def can_enumerate_processes(self) -> bool:
+        return os.path.isdir("/proc")
+
+    def can_enumerate_sockets(self) -> bool:
+        return os.path.exists("/proc/net/tcp") or os.path.exists("/proc/net/tcp6")
+
+    def iter_processes(self) -> Iterable[ProcInfo]:
+        if not os.path.isdir("/proc"):
+            return
+        for entry in glob.glob("/proc/[0-9]*"):
+            pid = os.path.basename(entry)
+            comm = (read_text(os.path.join(entry, "comm")) or "").strip()
+            cmdline_raw = read_text(os.path.join(entry, "cmdline")) or ""
+            cmdline = cmdline_raw.replace("\x00", " ").strip()
+            try:
+                exe = os.readlink(os.path.join(entry, "exe"))
+            except (OSError, PermissionError):
+                exe = ""
+            yield ProcInfo(pid=pid, comm=comm, cmdline=cmdline, exe=exe)
+
+    def iter_sockets(self) -> Iterable[SockInfo]:
+        for fam, path in (("tcp", "/proc/net/tcp"), ("tcp6", "/proc/net/tcp6")):
+            if not os.path.exists(path):
+                continue
+            for line in read_lines(path)[1:]:       # skip header
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                lhost, lport = parse_procnet_addr(parts[1])
+                rhost, rport = parse_procnet_addr(parts[2])
+                state = "LISTEN" if parts[3].upper() == "0A" else parts[3].upper()
+                yield SockInfo(fam, lhost, lport, rhost, rport, state)
+
+    def iter_scheduled_jobs(self) -> Iterable[JobInfo]:
+        cron_files = ["/etc/crontab"]
+        cron_files += glob.glob("/etc/cron.d/*")
+        for sub in ("hourly", "daily", "weekly", "monthly"):
+            cron_files += glob.glob(f"/etc/cron.{sub}/*")
+        cron_files += glob.glob("/var/spool/cron/crontabs/*")
+        cron_files += glob.glob("/var/spool/cron/*")
+        for path in cron_files:
+            if not os.path.isfile(path):
+                continue
+            txt = read_text(path)
+            if txt is None:
+                yield JobInfo(source=path, lines=None)   # signal unreadable
+                continue
+            yield JobInfo(source=path, lines=txt.splitlines())
+
+    def iter_authorized_keys(self, homes) -> Iterable[Tuple[str, list]]:
+        for home in homes:
+            for name in ("authorized_keys", "authorized_keys2"):
+                path = os.path.join(home, ".ssh", name)
+                if not os.path.exists(path):
+                    continue
+                lines = read_lines(path)
+                if not lines and read_text(path) is None:
+                    yield (path, None)                   # unreadable
+                else:
+                    yield (path, lines)
+
+    def iter_persistence_rc(self, homes) -> Iterable[Tuple[str, list]]:
+        rc_names = (".profile", ".bashrc", ".bash_profile", ".bash_login")
+        for home in homes:
+            for name in rc_names:
+                path = os.path.join(home, name)
+                if os.path.isfile(path):
+                    yield (path, read_lines(path))
+
+    def history_suppression(self, homes) -> list:
+        hits = []
+        rc_names = (".profile", ".bashrc", ".bash_profile", ".bash_login")
+        for home in homes:
+            for name in rc_names:
+                path = os.path.join(home, name)
+                if not os.path.isfile(path):
+                    continue
+                for i, line in enumerate(read_lines(path), 1):
+                    s = line.strip()
+                    if re.search(r"\bunset\s+HISTFILE\b", s) or \
+                            re.search(r"\bHISTFILE\s*=\s*(/dev/null)?\s*$", s) or \
+                            "HISTFILE=/dev/null" in s:
+                        hits.append(f"{path}:{i}: {s[:160]}")
+            hist = os.path.join(home, ".bash_history")
+            try:
+                if os.path.islink(hist) and os.path.realpath(hist) == "/dev/null":
+                    hits.append(f"{hist} -> /dev/null (history suppressed)")
+            except OSError:
+                pass
+        return hits
+
+    def masquerade_findings(self, procs) -> list:
+        # The miner is launched via exec -a with syslog-style names; the real
+        # daemon's comm is 'syslog-ng', not 'syslog-ng-<hash>'.
+        hits = []
+        for p in procs:
+            if p.comm.startswith("syslog-ng-"):
+                hits.append(f"pid {p.pid}: comm={p.comm!r} exe={p.exe or '?'}")
+        return hits
+
+
+class WindowsHostProvider(HostProvider):
+    """REDCap on Windows (IIS or Apache/XAMPP). BEST-EFFORT, UNVALIDATED.
+
+    The documented campaign is Linux-only, so these host-state checks look for
+    GENERIC post-exploitation and have not been run against a live Windows host
+    (see the module WINDOWS SUPPORT note). Every primitive is guarded so that,
+    on a non-Windows box (e.g. when forced via --platform for a dry run), it
+    simply returns nothing rather than running a same-named Linux binary.
+    Stdlib only: subprocess to tasklist/netstat/schtasks/reg + file reads.
+    """
+    name = "windows"
+    host_state_confidence = "provisional"
+
+    def _on_windows(self) -> bool:
+        return os.name == "nt"
+
+    def is_privileged(self) -> bool:
+        if not self._on_windows():
+            return False
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            # Fallback: `net session` succeeds only when elevated.
+            return _run(["net", "session"]) is not None
+
+    def staging_dirs(self) -> list:
+        dirs = []
+        for env in ("TEMP", "TMP", "PUBLIC", "ProgramData", "SystemRoot"):
+            val = os.environ.get(env)
+            if val:
+                dirs.append(val)
+        # SystemRoot\Temp and a couple of fixed spots the campaign class favors.
+        sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+        dirs.append(os.path.join(sysroot, "Temp"))
+        dirs.append(r"C:\Windows\Temp")
+        dirs.append(r"C:\ProgramData")
+        # De-dup preserving order.
+        return _dedup([d for d in dirs if d])
+
+    def exec_from_dirs(self) -> tuple:
+        return tuple(self.staging_dirs())
+
+    def home_dirs(self, extra) -> list:
+        homes = []
+        users = os.environ.get("SystemDrive", "C:") + r"\Users"
+        try:
+            for name in sorted(os.listdir(users)):
+                p = os.path.join(users, name)
+                if os.path.isdir(p) and name.lower() not in ("default", "default user",
+                                                             "all users", "public"):
+                    homes.append(p)
+        except (OSError, PermissionError):
+            pass
+        for d in extra or []:
+            if d not in homes:
+                homes.append(d)
+        return [h for h in homes if os.path.isdir(h)]
+
+    def default_log_dirs(self) -> list:
+        sysdrive = os.environ.get("SystemDrive", "C:")
+        return [
+            sysdrive + r"\inetpub\logs\LogFiles",       # IIS (W3C), per-site subdirs
+            sysdrive + r"\xampp\apache\logs",            # XAMPP (CLF)
+            sysdrive + r"\Apache24\logs",                # Apache Lounge (CLF)
+        ]
+
+    def log_globs(self) -> list:
+        # IIS: u_exYYMMDD.log / u_in*.log under W3SVC<n> subdirs; Apache: access.log
+        return ["*.log", "u_ex*.log", "*access*", "*.log.gz", "*access*.gz"]
+
+    def fetch_to_shell_res(self) -> list:
+        return [WIN_FETCH_TO_SHELL_RE, FETCH_TO_SHELL_RE]
+
+    def can_enumerate_processes(self) -> bool:
+        return self._on_windows()
+
+    def can_enumerate_sockets(self) -> bool:
+        return self._on_windows()
+
+    def iter_processes(self) -> Iterable[ProcInfo]:
+        if not self._on_windows():
+            return
+        # Prefer PowerShell CIM (gives PID, Name, Path, CommandLine as CSV);
+        # fall back to wmic, then tasklist (name+pid only).
+        out = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                    "Get-CimInstance Win32_Process | "
+                    "Select-Object ProcessId,Name,ExecutablePath,CommandLine | "
+                    "ConvertTo-Csv -NoTypeInformation"])
+        if out:
+            import csv
+            import io
+            try:
+                rdr = csv.DictReader(io.StringIO(out))
+                for row in rdr:
+                    yield ProcInfo(
+                        pid=(row.get("ProcessId") or "").strip(),
+                        comm=(row.get("Name") or "").strip(),
+                        cmdline=(row.get("CommandLine") or "").strip(),
+                        exe=(row.get("ExecutablePath") or "").strip())
+                return
+            except Exception:
+                pass
+        out = _run(["wmic", "process", "get",
+                    "ProcessId,Name,ExecutablePath,CommandLine", "/format:csv"])
+        if out:
+            import csv
+            import io
+            try:
+                for row in csv.DictReader(io.StringIO(out.strip())):
+                    yield ProcInfo(
+                        pid=(row.get("ProcessId") or "").strip(),
+                        comm=(row.get("Name") or "").strip(),
+                        cmdline=(row.get("CommandLine") or "").strip(),
+                        exe=(row.get("ExecutablePath") or "").strip())
+                return
+            except Exception:
+                pass
+        out = _run(["tasklist", "/fo", "csv", "/nh"])
+        if out:
+            import csv
+            import io
+            for row in csv.reader(io.StringIO(out)):
+                if len(row) >= 2:
+                    yield ProcInfo(pid=row[1].strip(), comm=row[0].strip())
+
+    def iter_sockets(self) -> Iterable[SockInfo]:
+        if not self._on_windows():
+            return
+        out = _run(["netstat", "-ano", "-p", "TCP"]) or _run(["netstat", "-ano"])
+        if not out:
+            return
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 4 or parts[0].upper() not in ("TCP", "TCP6"):
+                continue
+            proto = "tcp6" if ":" in parts[1] and parts[1].count(":") > 1 else "tcp"
+            lhost, lport = _split_host_port(parts[1])
+            rhost, rport = _split_host_port(parts[2])
+            raw_state = parts[3].upper()
+            state = "LISTEN" if raw_state == "LISTENING" else raw_state
+            yield SockInfo(proto, lhost, lport, rhost, rport, state)
+
+    def iter_scheduled_jobs(self) -> Iterable[JobInfo]:
+        if not self._on_windows():
+            return
+        # Read the Task Scheduler job XML directly (read-only) and surface the
+        # command/arguments text for cradle/IOC matching.
+        sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+        tasks_root = os.path.join(sysroot, "System32", "Tasks")
+        try:
+            import xml.etree.ElementTree as ET
+        except Exception:
+            ET = None
+        for dirpath, _dirs, files in os.walk(tasks_root):
+            for fn in files:
+                path = os.path.join(dirpath, fn)
+                txt = read_text(path)
+                if txt is None:
+                    yield JobInfo(source=path, lines=None)
+                    continue
+                lines = []
+                if ET is not None:
+                    try:
+                        root = ET.fromstring(txt)
+                        for el in root.iter():
+                            tag = el.tag.split("}")[-1].lower()
+                            if tag in ("command", "arguments") and el.text:
+                                lines.append(el.text.strip())
+                    except Exception:
+                        lines = txt.splitlines()
+                else:
+                    lines = txt.splitlines()
+                yield JobInfo(source=path, lines=lines)
+
+    def iter_authorized_keys(self, homes) -> Iterable[Tuple[str, list]]:
+        # Windows OpenSSH: per-user %USERPROFILE%\.ssh\authorized_keys plus the
+        # shared administrators_authorized_keys under %ProgramData%\ssh.
+        paths = []
+        for home in homes:
+            paths.append(os.path.join(home, ".ssh", "authorized_keys"))
+        progdata = os.environ.get("ProgramData", r"C:\ProgramData")
+        paths.append(os.path.join(progdata, "ssh", "administrators_authorized_keys"))
+        for path in paths:
+            if not os.path.exists(path):
+                continue
+            lines = read_lines(path)
+            if not lines and read_text(path) is None:
+                yield (path, None)
+            else:
+                yield (path, lines)
+
+    def iter_persistence_rc(self, homes) -> Iterable[Tuple[str, list]]:
+        # PowerShell profiles are the closest analogue to shell rc files.
+        rel = [
+            os.path.join("Documents", "WindowsPowerShell", "profile.ps1"),
+            os.path.join("Documents", "WindowsPowerShell",
+                         "Microsoft.PowerShell_profile.ps1"),
+            os.path.join("Documents", "PowerShell", "profile.ps1"),
+            os.path.join("Documents", "PowerShell",
+                         "Microsoft.PowerShell_profile.ps1"),
+        ]
+        for home in homes:
+            for r in rel:
+                path = os.path.join(home, r)
+                if os.path.isfile(path):
+                    yield (path, read_lines(path))
+        # All-hosts system profile.
+        sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+        for p in (os.path.join(sysroot, "System32", "WindowsPowerShell", "v1.0",
+                               "profile.ps1"),):
+            if os.path.isfile(p):
+                yield (p, read_lines(p))
+        # Registry Run keys (read-only via `reg query`), surfaced as pseudo-files.
+        if self._on_windows():
+            for hive in (r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run",
+                         r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"):
+                out = _run(["reg", "query", hive])
+                if out:
+                    yield (hive, out.splitlines())
+
+    def history_suppression(self, homes) -> list:
+        hits = []
+        for home in homes:
+            for r in (os.path.join("Documents", "WindowsPowerShell", "profile.ps1"),
+                      os.path.join("Documents", "PowerShell", "profile.ps1")):
+                path = os.path.join(home, r)
+                if not os.path.isfile(path):
+                    continue
+                for i, line in enumerate(read_lines(path), 1):
+                    s = line.strip()
+                    if re.search(r"HistorySaveStyle\s+SaveNothing", s, re.IGNORECASE) \
+                            or re.search(r"\bClear-History\b", s, re.IGNORECASE) \
+                            or re.search(r"Remove-Item[^\n]*ConsoleHost_history",
+                                         s, re.IGNORECASE):
+                        hits.append(f"{path}:{i}: {s[:160]}")
+        return hits
+
+    def masquerade_findings(self, procs) -> list:
+        # Generic Windows heuristic (provisional): a core system image name
+        # running from outside System32/SysWOW64 is a classic masquerade.
+        system_names = {"svchost.exe", "lsass.exe", "services.exe", "csrss.exe",
+                        "winlogon.exe", "smss.exe", "explorer.exe"}
+        ok_dirs = (r"c:\windows\system32", r"c:\windows\syswow64", r"c:\windows\sysnative")
+        hits = []
+        for p in procs:
+            nm = (p.comm or "").lower()
+            if nm in system_names and p.exe:
+                low = p.exe.lower()
+                if not any(low.startswith(d) for d in ok_dirs):
+                    hits.append(f"pid {p.pid}: {p.comm!r} runs from {p.exe} "
+                                "(system image outside System32)")
+        return hits
+
+
+def _split_host_port(hostport: str) -> tuple:
+    """Split a netstat 'addr:port' token (IPv4 'ip:port' or IPv6 '[::1]:port')."""
+    s = hostport.strip()
+    if s.startswith("["):
+        # [ipv6]:port
+        close = s.rfind("]")
+        host = s[1:close] if close != -1 else s
+        rest = s[close + 1:]
+        port = rest.lstrip(":")
+    else:
+        idx = s.rfind(":")
+        host = s[:idx] if idx != -1 else s
+        port = s[idx + 1:] if idx != -1 else ""
+    try:
+        return (host, int(port))
+    except ValueError:
+        return (host, 0)
+
+
+def select_provider(platform_opt: str) -> HostProvider:
+    """Pick a HostProvider from --platform (auto|linux|windows)."""
+    if platform_opt == "linux":
+        return LinuxHostProvider()
+    if platform_opt == "windows":
+        return WindowsHostProvider()
+    # auto
+    if os.name == "nt":
+        return WindowsHostProvider()
+    return LinuxHostProvider()
+
+
+# --------------------------------------------------------------------------- #
+# Checks (platform-neutral; all host access goes through the provider)
 # --------------------------------------------------------------------------- #
 
 def check_version(rep: Report, redcap_root: str) -> None:
@@ -535,13 +1224,13 @@ def check_version(rep: Report, redcap_root: str) -> None:
 # files in temp/cache are still detected by content hash in check_hashes().)
 
 
-def check_staging(rep: Report) -> None:
+def check_staging(rep: Report, host: HostProvider) -> None:
     hits = []
-    # Exact documented archive path.
+    # Exact documented archive path (Linux campaign artifact).
     if os.path.exists(IOC_MINER_ARCHIVE):
         hits.append((SEV_CRITICAL, f"{IOC_MINER_ARCHIVE} (mtime {mtime_str(IOC_MINER_ARCHIVE)})"))
     # Masquerading .syslog-* staging dirs and stray xmrig archives.
-    for base in STAGING_DIRS:
+    for base in host.staging_dirs():
         for p in glob.glob(os.path.join(base, ".syslog-*")):
             hits.append((SEV_HIGH, f"{p} (mtime {mtime_str(p)})"))
         for p in glob.glob(os.path.join(base, "**", "xmrig*"), recursive=True):
@@ -551,7 +1240,7 @@ def check_staging(rep: Report) -> None:
                         "Miner staging artifact(s) found",
                         "Files/dirs matching the XMRig staging pattern.",
                         evidence=[h[1] for h in hits]))
-    # Competitor-removal dirs locked to 000.
+    # Competitor-removal dirs locked to 000 (Linux-specific permission TTP).
     comp = []
     for d in IOC_COMPETITOR_DIRS:
         if os.path.exists(d):
@@ -567,9 +1256,9 @@ def check_staging(rep: Report) -> None:
                         evidence=comp))
 
 
-def _hash_candidates(full: bool, redcap_root: str) -> Iterable[str]:
+def _hash_candidates(full: bool, redcap_root: str, host: HostProvider) -> Iterable[str]:
     seen = set()
-    roots = [os.path.join(redcap_root, "temp", "cache")] + STAGING_DIRS
+    roots = [os.path.join(redcap_root, "temp", "cache")] + host.staging_dirs()
     for base in roots:
         if not os.path.isdir(base):
             continue
@@ -599,10 +1288,10 @@ def _hash_candidates(full: bool, redcap_root: str) -> Iterable[str]:
                                 yield q
 
 
-def check_hashes(rep: Report, redcap_root: str, full: bool) -> None:
+def check_hashes(rep: Report, redcap_root: str, full: bool, host: HostProvider) -> None:
     matched = []
     count = 0
-    for path in _hash_candidates(full, redcap_root):
+    for path in _hash_candidates(full, redcap_root, host):
         count += 1
         if sha256_file(path) == IOC_DROPPER_SHA256:
             matched.append(path)
@@ -615,29 +1304,22 @@ def check_hashes(rep: Report, redcap_root: str, full: bool) -> None:
         rep.note("No candidate files were available to hash.")
 
 
-def check_processes(rep: Report) -> None:
-    if not os.path.isdir("/proc"):
-        rep.note("/proc unavailable; process check skipped.")
+def check_processes(rep: Report, host: HostProvider) -> None:
+    if not host.can_enumerate_processes():
+        rep.note("Process enumeration unavailable on this host; process check skipped.")
         return
-    masq, fromtmp, miner = [], [], []
-    for entry in glob.glob("/proc/[0-9]*"):
-        pid = os.path.basename(entry)
-        comm = (read_text(os.path.join(entry, "comm")) or "").strip()
-        cmdline_raw = read_text(os.path.join(entry, "cmdline")) or ""
-        cmdline = cmdline_raw.replace("\x00", " ").strip()
-        try:
-            exe = os.readlink(os.path.join(entry, "exe"))
-        except (OSError, PermissionError):
-            exe = ""
-        low = (comm + " " + cmdline).lower()
+    procs = list(host.iter_processes())
+    fromtmp, miner = [], []
+    exec_dirs = tuple(d.lower() for d in host.exec_from_dirs())
+    for p in procs:
+        low = (p.comm + " " + p.cmdline).lower()
+        exe_low = (p.exe or "").lower()
+        if exec_dirs and exe_low.startswith(exec_dirs):
+            fromtmp.append(f"pid {p.pid}: exe={p.exe} comm={p.comm!r}")
+        if any(tok in low for tok in MINER_CMD_TOKENS):
+            miner.append(f"pid {p.pid}: comm={p.comm!r} cmd={p.cmdline[:200]!r}")
 
-        if comm.startswith("syslog-ng-"):
-            masq.append(f"pid {pid}: comm={comm!r} exe={exe or '?'}")
-        if exe.startswith(EXEC_FROM_DIRS):
-            fromtmp.append(f"pid {pid}: exe={exe} comm={comm!r}")
-        if ("xmrig" in low or "c3pool" in low or "stratum+tcp" in low
-                or IOC_MONERO_WALLET.lower() in low):
-            miner.append(f"pid {pid}: comm={comm!r} cmd={cmdline[:200]!r}")
+    masq = host.masquerade_findings(procs)
 
     if miner:
         rep.add(Finding(SEV_CRITICAL, "process",
@@ -647,35 +1329,36 @@ def check_processes(rep: Report) -> None:
     if fromtmp:
         rep.add(Finding(SEV_HIGH, "process",
                         "Process(es) executing from a temp directory",
-                        "Executables under /var/tmp, /dev/shm, or /tmp are a strong "
+                        "Executables under a temp/staging directory are a strong "
                         "indicator of the in-memory dropper / miner.",
                         evidence=fromtmp))
     if masq:
+        detail = ("The miner is launched via exec -a with syslog-style names; "
+                  "the real daemon's comm is 'syslog-ng', not 'syslog-ng-<hash>'.")
+        if host.host_state_confidence != "documented":
+            detail += (" (Provisional Windows heuristic: a system image running "
+                       "from outside System32 -- confirm manually.)")
         rep.add(Finding(SEV_HIGH, "process",
-                        "syslog-ng-* masquerading process(es)",
-                        "The miner is launched via exec -a with syslog-style names; "
-                        "the real daemon's comm is 'syslog-ng', not 'syslog-ng-<hash>'.",
+                        "Masquerading system-process name(s)", detail,
                         evidence=masq))
-    if not is_root():
-        rep.note("Process check ran without root; other users' exe links may be hidden.")
+    if not host.is_privileged():
+        rep.note("Process check ran without privilege; some process metadata may be hidden.")
 
 
-def check_sockets(rep: Report) -> None:
+def check_sockets(rep: Report, host: HostProvider) -> None:
+    if not host.can_enumerate_sockets():
+        rep.note("Socket enumeration unavailable on this host; socket check skipped.")
+        return
     listen, connected = [], []
-    for fam, path in (("tcp", "/proc/net/tcp"), ("tcp6", "/proc/net/tcp6")):
-        if not os.path.exists(path):
-            continue
-        for row in iter_proc_net(path):
-            lhost, lport = parse_procnet_addr(row["local"])
-            rhost, rport = parse_procnet_addr(row["remote"])
-            state = row["state"].upper()
-            if state == "0A" and lport == IOC_MINER_API_PORT and lhost in ("127.0.0.1", "::1"):
-                listen.append(f"{fam} LISTEN {lhost}:{lport}")
-            if rhost == IOC_SOURCE_IP:
-                connected.append(f"{fam} {state} -> {rhost}:{rport}")
+    for s in host.iter_sockets():
+        if s.state == "LISTEN" and s.lport == IOC_MINER_API_PORT and \
+                s.laddr in ("127.0.0.1", "::1", "0.0.0.0", "::"):
+            listen.append(f"{s.proto} LISTEN {s.laddr}:{s.lport}")
+        if s.raddr == IOC_SOURCE_IP:
+            connected.append(f"{s.proto} {s.state} -> {s.raddr}:{s.rport}")
     if listen:
         rep.add(Finding(SEV_HIGH, "socket",
-                        f"Local XMRig JSON-RPC API on 127.0.0.1:{IOC_MINER_API_PORT}",
+                        f"Local XMRig JSON-RPC API on :{IOC_MINER_API_PORT}",
                         "A listener on the miner's documented local control port.",
                         evidence=listen))
     if connected:
@@ -685,52 +1368,28 @@ def check_sockets(rep: Report) -> None:
                         evidence=connected))
 
 
-def _scan_file_for_patterns(path: str, rep_notes: Report) -> list:
-    """Return (lineno, text) hits for fetch-to-shell / IOC patterns in a file."""
-    hits = []
-    lines = read_lines(path)
-    for i, line in enumerate(lines, 1):
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        low = line.lower()
-        flagged = False
-        if FETCH_TO_SHELL_RE.search(line):
-            flagged = True
-        if IOC_POOL_DOMAIN in low or IOC_SOURCE_IP in line:
-            flagged = True
-        if any(name in low for name in (n.lower() for n in IOC_PAYLOAD_NAMES)):
-            flagged = True
-        if flagged:
-            hits.append((i, line.strip()[:200]))
-    return hits
-
-
-def check_cron(rep: Report) -> None:
-    cron_files = ["/etc/crontab"]
-    cron_files += glob.glob("/etc/cron.d/*")
-    for sub in ("hourly", "daily", "weekly", "monthly"):
-        cron_files += glob.glob(f"/etc/cron.{sub}/*")
-    cron_files += glob.glob("/var/spool/cron/crontabs/*")
-    cron_files += glob.glob("/var/spool/cron/*")
-
+def check_cron(rep: Report, host: HostProvider) -> None:
+    res = host.fetch_to_shell_res()
     evidence = []
     unreadable = 0
-    for path in cron_files:
-        if not os.path.isfile(path):
-            continue
-        if read_text(path) is None:
+    for job in host.iter_scheduled_jobs():
+        if job.lines is None:
             unreadable += 1
             continue
-        for lineno, text in _scan_file_for_patterns(path, rep):
-            evidence.append(f"{path}:{lineno}: {text}")
+        for lineno, line in enumerate(job.lines, 1):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if _line_is_suspicious(line, res):
+                evidence.append(f"{job.source}:{lineno}: {line.strip()[:200]}")
     if evidence:
         rep.add(Finding(SEV_HIGH, "cron",
-                        "Suspicious cron entry(ies) (fetch-to-shell / IOC)",
-                        "Cron content matches the campaign's remote-payload pull "
-                        "or references a known IOC. Review before acting.",
+                        "Suspicious scheduled-job entry(ies) (fetch-to-shell / IOC)",
+                        "Scheduled-task/cron content matches the campaign's remote-"
+                        "payload pull or references a known IOC. Review before acting.",
                         evidence=evidence))
-    if unreadable and not is_root():
-        rep.note(f"{unreadable} cron file(s) were unreadable without root; cron check partial.")
+    if unreadable and not host.is_privileged():
+        rep.note(f"{unreadable} scheduled-job file(s) were unreadable without "
+                 "privilege; scheduled-job check partial.")
 
 
 def _ssh_fingerprint(blob: str) -> Optional[str]:
@@ -742,21 +1401,14 @@ def _ssh_fingerprint(blob: str) -> Optional[str]:
         return None
 
 
-def check_authorized_keys(rep: Report, homes: list) -> None:
+def check_authorized_keys(rep: Report, host: HostProvider, homes: list) -> None:
     # Only report keys that match the IOC backdoor fingerprint. We deliberately
     # do NOT list or ask anyone to "review" the other keys: on a normal host
     # they belong to real user accounts and are not independently verifiable,
     # so listing them is pure noise.
     matched, unreadable = [], 0
-    key_files = []
-    for home in homes:
-        key_files.append(os.path.join(home, ".ssh", "authorized_keys"))
-        key_files.append(os.path.join(home, ".ssh", "authorized_keys2"))
-    for path in key_files:
-        if not os.path.exists(path):
-            continue
-        lines = read_lines(path)
-        if not lines and read_text(path) is None:
+    for path, lines in host.iter_authorized_keys(homes):
+        if lines is None:
             unreadable += 1
             continue
         for lineno, line in enumerate(lines, 1):
@@ -776,59 +1428,50 @@ def check_authorized_keys(rep: Report, homes: list) -> None:
                         f"A key contains the partial fingerprint {IOC_SSH_FP_PARTIAL!r} "
                         "reported as the attacker's backdoor key.",
                         evidence=matched))
-    if unreadable and not is_root():
-        rep.note(f"{unreadable} authorized_keys file(s) unreadable without root; SSH check partial.")
+    if unreadable and not host.is_privileged():
+        rep.note(f"{unreadable} authorized_keys file(s) unreadable without "
+                 "privilege; SSH check partial.")
 
 
-def check_profiles(rep: Report, homes: list) -> None:
+def check_profiles(rep: Report, host: HostProvider, homes: list) -> None:
+    res = host.fetch_to_shell_res()
     evidence = []
-    histfile_hits = []
-    rc_names = (".profile", ".bashrc", ".bash_profile", ".bash_login")
-    for home in homes:
-        for name in rc_names:
-            path = os.path.join(home, name)
-            if not os.path.isfile(path):
+    for path, lines in host.iter_persistence_rc(homes):
+        for lineno, line in enumerate(lines, 1):
+            if not line.strip() or line.lstrip().startswith("#"):
                 continue
-            for lineno, text in _scan_file_for_patterns(path, rep):
-                evidence.append(f"{path}:{lineno}: {text}")
-            for i, line in enumerate(read_lines(path), 1):
-                s = line.strip()
-                if re.search(r"\bunset\s+HISTFILE\b", s) or \
-                        re.search(r"\bHISTFILE\s*=\s*(/dev/null)?\s*$", s) or \
-                        "HISTFILE=/dev/null" in s:
-                    histfile_hits.append(f"{path}:{i}: {s[:160]}")
-        # bash_history tampering
-        hist = os.path.join(home, ".bash_history")
-        try:
-            if os.path.islink(hist) and os.path.realpath(hist) == "/dev/null":
-                histfile_hits.append(f"{hist} -> /dev/null (history suppressed)")
-        except OSError:
-            pass
+            if _line_is_suspicious(line, res):
+                evidence.append(f"{path}:{lineno}: {line.strip()[:200]}")
+    histfile_hits = host.history_suppression(homes)
     if evidence:
         rep.add(Finding(SEV_HIGH, "profile",
-                        "Shell rc/profile contains fetch-to-shell / IOC content",
+                        "Startup/profile file contains fetch-to-shell / IOC content",
                         "Injected startup code matching the campaign's persistence.",
                         evidence=evidence))
     if histfile_hits:
         rep.add(Finding(SEV_MEDIUM, "profile",
-                        "Shell history suppression detected (anti-forensics)",
-                        "HISTFILE is unset/nulled or .bash_history points to /dev/null. "
-                        "The campaign disables history to hide its tracks.",
+                        "Shell/console history suppression detected (anti-forensics)",
+                        "History is unset/nulled or redirected. The campaign disables "
+                        "history to hide its tracks.",
                         evidence=histfile_hits))
 
 
-def check_access_logs(rep: Report, log_dirs: list, mitigation_date=None,
-                      max_matches=MAX_LOG_MATCHES) -> None:
+def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
+                      mitigation_date=None, max_matches=MAX_LOG_MATCHES) -> None:
     # max_matches is how many example entries to list per category; None = all.
     # Matched attack lines are kept VERBATIM (untruncated) -- the full request,
     # status, and user-agent are exactly what makes them worth reading.
+    # Apache/nginx CLF and IIS W3C logs are both handled here: iter_clf_lines()
+    # transparently converts W3C rows to the combined-log shape, so everything
+    # below is format-agnostic.
     unlimited = max_matches is None
     files = []
     for d in log_dirs:
         if not os.path.isdir(d):
             continue
-        files += glob.glob(os.path.join(d, "*access*"))
-        files += glob.glob(os.path.join(d, "*access*.gz"))
+        for pat in host.log_globs():
+            files += glob.glob(os.path.join(d, pat))
+            files += glob.glob(os.path.join(d, "**", pat), recursive=True)
     files = sorted(set(files))
     if not files:
         rep.note("No web-server access logs found; exploit-attempt check skipped. "
@@ -842,12 +1485,13 @@ def check_access_logs(rep: Report, log_dirs: list, mitigation_date=None,
     unreadable = 0
     by_ip = {}                               # per-source-IP behaviour aggregate
     for path in files:
-        fh = open_maybe_gzip(path)
-        if fh is None:
+        try:
+            line_iter = iter_clf_lines(path)
+        except OSError:
             unreadable += 1
             continue
         try:
-            for line in fh:
+            for line in line_iter:
                 ex, rc = _classify_log_line(line)
                 if not (ex or rc):
                     continue
@@ -910,8 +1554,6 @@ def check_access_logs(rep: Report, log_dirs: list, mitigation_date=None,
                         recon_ev.append(f"{path} [{tstr}]: [{'; '.join(rc)}] {line.strip()}")
         except Exception:
             unreadable += 1
-        finally:
-            fh.close()
 
     # Distinct source IPs that issued exploit-shaped requests (the "other
     # attackers" surfaced by pattern, not by the known IOC IP).
@@ -981,8 +1623,8 @@ def check_access_logs(rep: Report, log_dirs: list, mitigation_date=None,
                         "reconnaissance. Worth noting that the host was targeted, but "
                         "not evidence of exploitation on its own.",
                         evidence=recon_ev))
-    if unreadable and not is_root():
-        rep.note(f"{unreadable} log file(s) unreadable without root; log check partial.")
+    if unreadable and not host.is_privileged():
+        rep.note(f"{unreadable} log file(s) unreadable without privilege; log check partial.")
 
 
 # --------------------------------------------------------------------------- #
@@ -1056,6 +1698,7 @@ def render_text(rep: Report, args) -> str:
     out.append("=" * 72)
     out.append("CVE-2026-90817 REDCap compromise scan (read-only / passive)")
     out.append(f"host:        {socket.gethostname()}")
+    out.append(f"platform:    {rep.platform_name or 'unknown'}")
     out.append(f"time:        {datetime.datetime.now().isoformat(timespec='seconds')}")
     out.append(f"redcap root: {args.redcap_root}")
     out.append(f"redcap ver:  {rep.redcap_version or 'unknown'}")
@@ -1063,7 +1706,7 @@ def render_text(rep: Report, args) -> str:
     if rep.mitigation_source:
         mit += f"  ({rep.mitigation_source})"
     out.append(f"mitigation:  {mit}")
-    out.append(f"privileges:  {'root' if is_root() else 'NON-ROOT (scan is partial)'}")
+    out.append(f"privileges:  {'privileged' if rep.privileged else 'UNPRIVILEGED (scan is partial)'}")
     out.append("=" * 72)
     for i, line in enumerate(_wrap(f"VERDICT: {verdict(rep)}", 70)):
         out.append(line if i == 0 else f"         {line}")
@@ -1126,6 +1769,17 @@ def render_text(rep: Report, args) -> str:
             out.append(f"  * {n}")
         out.append("")
 
+    # On a provisional provider (Windows), remind the reader the host-state
+    # checks are generic/unvalidated, so a clean host-state result is weaker.
+    if rep.platform_name == "windows":
+        out.append("NOTE (Windows): host-state compromise checks are PROVISIONAL "
+                   "generic heuristics,")
+        out.append("      not the documented Linux campaign IOCs, and are not yet "
+                   "validated on")
+        out.append("      real hardware. The version and web-log findings are "
+                   "fully supported.")
+        out.append("")
+
     # Only suggest remediation when there is actually something to remediate.
     if rep.has_at_least(SEV_LOW):
         out.append("-" * 72)
@@ -1157,11 +1811,12 @@ def render_json(rep: Report, args) -> str:
         "tool": "redcap_cve_2026_90817_scan",
         "cve": "CVE-2026-90817",
         "host": socket.gethostname(),
+        "platform": rep.platform_name,
         "time": datetime.datetime.now().isoformat(timespec="seconds"),
         "redcap_root": args.redcap_root,
         "redcap_version": rep.redcap_version,
-        "privileges": "root" if is_root() else "non-root",
-        "partial_scan": rep.partial or not is_root(),
+        "privileges": "privileged" if rep.privileged else "unprivileged",
+        "partial_scan": rep.partial or not rep.privileged,
         "mitigation_date": rep.mitigation_date,
         "mitigation_source": rep.mitigation_source,
         "attack_summary": rep.attack_summary,
@@ -1176,9 +1831,9 @@ def render_json(rep: Report, args) -> str:
 def compute_exit_code(rep: Report) -> int:
     if rep.has_at_least(SEV_MEDIUM):
         return 1
-    # Clean so far. If the scan was partial (non-root/errors), we cannot fully
-    # assert "clean" -> exit 2. Otherwise 0.
-    if rep.partial or not is_root() or any(f.severity == SEV_ERROR for f in rep.findings):
+    # Clean so far. If the scan was partial (unprivileged/errors), we cannot
+    # fully assert "clean" -> exit 2. Otherwise 0.
+    if rep.partial or not rep.privileged or any(f.severity == SEV_ERROR for f in rep.findings):
         return 2
     return 0
 
@@ -1191,9 +1846,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="REDCap install root (default: /var/www/html/redcap)")
     p.add_argument("--log-dir", action="append", default=None,
                    help="Web-server log dir to scan (repeatable). "
-                        "Default: /var/log/apache2, /var/log/httpd, /var/log/nginx.")
+                        "Default: platform-specific (Apache/nginx on Linux, "
+                        "IIS/Apache on Windows).")
     p.add_argument("--home-dir", action="append", default=None,
                    help="Extra home dir to scan for SSH keys / rc files (repeatable).")
+    p.add_argument("--platform", choices=("auto", "linux", "windows"), default="auto",
+                   help="Host platform to assume (default: auto-detect). Forcing a "
+                        "platform selects that provider; the OS-specific host-state "
+                        "probes still only run on the matching live OS.")
     p.add_argument("--full-hash-scan", action="store_true",
                    help="Recursively hash files under temp/cache and staging dirs "
                         "(slower). Default: a bounded set only.")
@@ -1211,13 +1871,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv=None) -> int:
-    args = build_arg_parser().parse_args(argv)
-    log_dirs = args.log_dir or ["/var/log/apache2", "/var/log/httpd", "/var/log/nginx"]
-    homes = list_home_dirs(args.home_dir)
+def run_scan(args, host: HostProvider) -> Report:
+    """Run every check against the given provider and return the Report.
+    Separated from main() so tests can drive it with an injected provider."""
+    log_dirs = args.log_dir or host.default_log_dirs()
+    homes = host.home_dirs(args.home_dir)
 
     rep = Report()
-    if not is_root():
+    rep.platform_name = host.name
+    rep.privileged = host.is_privileged()
+    if not rep.privileged:
         rep.partial = True
 
     # Resolve the mitigation date: explicit flag wins, else infer from the
@@ -1228,9 +1891,8 @@ def main(argv=None) -> int:
             mitigation_date = datetime.date.fromisoformat(args.mitigation_date)
             rep.mitigation_source = "provided via --mitigation-date"
         except ValueError:
-            print(f"error: --mitigation-date must be YYYY-MM-DD (got "
-                  f"{args.mitigation_date!r})", file=sys.stderr)
-            return 2
+            raise ValueError(f"--mitigation-date must be YYYY-MM-DD (got "
+                             f"{args.mitigation_date!r})")
     else:
         mitigation_date, rep.mitigation_source = detect_mitigation_date(args.redcap_root)
     rep.mitigation_date = mitigation_date.isoformat() if mitigation_date else None
@@ -1243,21 +1905,20 @@ def main(argv=None) -> int:
         try:
             max_matches = int(_mlm)
         except ValueError:
-            print(f"error: --max-log-matches must be an integer or 'all' (got "
-                  f"{args.max_log_matches!r})", file=sys.stderr)
-            return 2
+            raise ValueError(f"--max-log-matches must be an integer or 'all' (got "
+                             f"{args.max_log_matches!r})")
 
     # Each check is isolated so one failure never aborts the scan.
     checks = [
         ("version", lambda: check_version(rep, args.redcap_root)),
-        ("staging", lambda: check_staging(rep)),
-        ("hash", lambda: check_hashes(rep, args.redcap_root, args.full_hash_scan)),
-        ("process", lambda: check_processes(rep)),
-        ("socket", lambda: check_sockets(rep)),
-        ("cron", lambda: check_cron(rep)),
-        ("ssh", lambda: check_authorized_keys(rep, homes)),
-        ("profile", lambda: check_profiles(rep, homes)),
-        ("weblog", lambda: check_access_logs(rep, log_dirs, mitigation_date, max_matches)),
+        ("staging", lambda: check_staging(rep, host)),
+        ("hash", lambda: check_hashes(rep, args.redcap_root, args.full_hash_scan, host)),
+        ("process", lambda: check_processes(rep, host)),
+        ("socket", lambda: check_sockets(rep, host)),
+        ("cron", lambda: check_cron(rep, host)),
+        ("ssh", lambda: check_authorized_keys(rep, host, homes)),
+        ("profile", lambda: check_profiles(rep, host, homes)),
+        ("weblog", lambda: check_access_logs(rep, log_dirs, host, mitigation_date, max_matches)),
     ]
     for name, fn in checks:
         try:
@@ -1266,6 +1927,17 @@ def main(argv=None) -> int:
             rep.add(Finding(SEV_ERROR, name, f"check '{name}' raised an error",
                             str(exc)))
             rep.partial = True
+    return rep
+
+
+def main(argv=None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    host = select_provider(args.platform)
+    try:
+        rep = run_scan(args, host)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     out = render_json(rep, args) if args.json else render_text(rep, args)
     print(out)
