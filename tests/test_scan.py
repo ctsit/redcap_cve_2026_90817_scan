@@ -433,6 +433,52 @@ class ObservedIocTests(unittest.TestCase):
         self.assertEqual(self._recon(self._line("/surveys/?s=X", "200", ua=real)), [])
 
 
+class ProbePatternVerdictTests(unittest.TestCase):
+    """Doubled-path / fake-UA probes from unknown IPs are reported as recon but
+    never count toward the attack totals or the mitigation-date verdict."""
+
+    def _scan(self, lines):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = os.path.join(tmp, "logs")
+            os.makedirs(logs)
+            with open(os.path.join(logs, "access.log"), "w") as out:
+                out.write("\n".join(lines) + "\n")
+            root = os.path.join(tmp, "redcap")
+            os.makedirs(os.path.join(root, "redcap_v17.5.6"))
+            args = make_args(redcap_root=root, log_dir=[logs],
+                             mitigation_date="2026-09-21")
+            return scan.run_scan(args, FakeProvider())
+
+    PROBE = ('198.51.100.77 - - [01/Sep/2026:10:00:00 -0400] '
+             '"GET /redcap/surveys/surveys?s=X HTTP/1.1" 404 322 "-" "Mozilla/5.0"')
+    EXPLOIT = ('198.51.100.88 - - [10/Oct/2026:10:00:00 -0400] "GET /redcap/surveys/'
+               '?s=Y&__passthru=%2569ndex.php&route=ParcelController%3Ashow HTTP/1.1"'
+               ' 200 5 "-" "x"')
+
+    def test_pre_patch_probe_alone_is_not_an_attack(self):
+        rep = self._scan([self.PROBE])
+        self.assertIsNone(rep.attack_summary)
+        self.assertNotIn("COMPROMISED", scan.verdict(rep))
+        recon = [f for f in findings_by_check(rep)["weblog"]
+                 if f.title.startswith("Reconnaissance")]
+        self.assertEqual(len(recon), 1)          # still reported
+
+    def test_pre_patch_probe_does_not_flip_timing(self):
+        rep = self._scan([self.PROBE, self.EXPLOIT])
+        s = rep.attack_summary
+        self.assertEqual((s["total"], s["before_mitigation"], s["probe_only"]),
+                         (1, 0, 1))
+        self.assertIn("NOT LIKELY COMPROMISED", scan.verdict(rep))
+        self.assertIn("1 probe-pattern-only, not counted",
+                      scan.render_text(rep, make_args()))
+
+    def test_probe_from_known_ip_still_counts(self):
+        line = self.PROBE.replace("198.51.100.77", "5.180.77.102")
+        rep = self._scan([line])
+        self.assertEqual(rep.attack_summary["before_mitigation"], 1)
+        self.assertIn("LIKELY COMPROMISED", scan.verdict(rep))
+
+
 class LogWindowTests(unittest.TestCase):
     """--since / --until limit both log passes; host state is unaffected."""
 

@@ -152,6 +152,12 @@ exploit-shaped requests:
   `Gecko/8618-10-13 16:07:47.714447 Firefox/3.8`, the kind of string Python
   Faker generates. Real browsers send e.g. `Gecko/20100101`.
 
+A line that matches **only** one of these two probe patterns is listed as
+reconnaissance but does **not** count toward the attack totals or the
+[attack-timing](#attack-timing) verdict. Either pattern can come from a benign
+source, such as a broken link or an odd client. When the same line comes from a
+known attacker IP, it counts as usual.
+
 #### Observed attacker IPs (not in the Unit 42 report)
 
 These IPs sent exploit-shaped requests to a UF REDCap host in October 2026.

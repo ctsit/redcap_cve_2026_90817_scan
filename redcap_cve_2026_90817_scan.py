@@ -191,6 +191,13 @@ KNOWN_EXPLOIT_CONTROLLERS = {"dataimportcontroller", "parcelcontroller"}
 # Not IOCs: python-requests (too generic) and the 5-byte 2xx response (that is
 # reachability, already ranked by HTTP status).
 FAKE_UA_RE = re.compile(r"Gecko/\d{1,4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+REASON_DOUBLED_PATH = "doubled survey path (campaign path-join bug)"
+REASON_FAKE_UA = "tool-generated user agent (timestamp in Gecko token)"
+# A line matched ONLY by these patterns (no exploit shape, no known attacker IP)
+# is reported as reconnaissance but kept out of the attack totals and the
+# mitigation-date timing, so it never drives the verdict: either pattern can come
+# from a benign source (a broken link, an odd client) on any IP.
+PROBE_PATTERN_REASONS = {REASON_DOUBLED_PATH, REASON_FAKE_UA}
 
 # Patched releases and affected floor (public threat-intel; confirm vs. vendor).
 FIXED_VERSIONS = {
@@ -735,11 +742,11 @@ def _classify_log_line(line: str, known_ips: Iterable = (IOC_SOURCE_IP,)) -> tup
     if '" 404 ' in line and "surveys" in line:
         _m, path, _q, _ua = _parse_request_fields(line)
         if path and _is_doubled_survey_path(path):
-            recon.append("doubled survey path (campaign path-join bug)")
+            recon.append(REASON_DOUBLED_PATH)
     if "Gecko/" in line and FAKE_UA_RE.search(line):
         _m, path, _q, _ua = _parse_request_fields(line)
         if path and "/surveys" in path:
-            recon.append("tool-generated user agent (timestamp in Gecko token)")
+            recon.append(REASON_FAKE_UA)
 
     return (_dedup(exploit), _dedup(recon))
 
@@ -1685,7 +1692,7 @@ def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
         return
 
     exploit_ev, recon_ev = [], []
-    exploit_total = recon_total = 0
+    exploit_total = recon_total = probe_total = 0
     before = on = after = undated = 0        # attack timing vs mitigation_date
     earliest = latest = None
     unreadable = 0
@@ -1705,12 +1712,15 @@ def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
                 if not _in_window(dt, rep.log_since, rep.log_until):
                     continue
                 tstr = dt.date().isoformat() if dt else "undated"
-                if dt is not None:
+                # Probe-pattern-only lines are listed as recon but not timed or
+                # totalled as attacks (see PROBE_PATTERN_REASONS).
+                probe_only = not ex and all(r in PROBE_PATTERN_REASONS for r in rc)
+                if dt is not None and not probe_only:
                     if earliest is None or dt < earliest:
                         earliest = dt
                     if latest is None or dt > latest:
                         latest = dt
-                if mitigation_date is not None:
+                if mitigation_date is not None and not probe_only:
                     if dt is None:
                         undated += 1
                     elif dt.date() < mitigation_date:
@@ -1745,7 +1755,10 @@ def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
                             f"{path} [{tstr}]: [{'; '.join(ex + rc)}] "
                             f"[{rank}] {line.strip()}")
                 else:
-                    recon_total += 1
+                    if probe_only:
+                        probe_total += 1
+                    else:
+                        recon_total += 1
                     agg["recon"] += 1
                     if unlimited or len(recon_ev) < max_matches:
                         recon_ev.append(f"{path} [{tstr}]: [{'; '.join(rc)}] {line.strip()}")
@@ -1764,6 +1777,7 @@ def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
             "total": total,
             "exploit": exploit_total,
             "recon": recon_total,
+            "probe_only": probe_total,
             "before_mitigation": before,
             "on_mitigation_date": on,
             "after_mitigation": after,
@@ -1778,8 +1792,8 @@ def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
     if not unlimited and exploit_total > max_matches:
         exploit_ev.append(f"... (+{exploit_total - max_matches} more exploit-shaped "
                           "request(s); pass --max-log-matches all to list every one)")
-    if not unlimited and recon_total > max_matches:
-        recon_ev.append(f"... (+{recon_total - max_matches} more reconnaissance "
+    if not unlimited and recon_total + probe_total > max_matches:
+        recon_ev.append(f"... (+{recon_total + probe_total - max_matches} more reconnaissance "
                         "request(s); pass --max-log-matches all to list every one)")
 
     if exploit_ev:
@@ -2092,8 +2106,10 @@ def render_text(rep: Report, args) -> str:
     s = rep.attack_summary
     if s:
         out.append("Attack timing (log requests classified as attacks):")
+        probes = (f"; +{s['probe_only']} probe-pattern-only, not counted"
+                  if s.get("probe_only") else "")
         out.append(f"  total {s['total']}  (exploit-shaped {s['exploit']}, "
-                   f"attacker-IP {s['recon']})")
+                   f"attacker-IP {s['recon']}{probes})")
         if rep.mitigation_date:
             out.append(f"  vs mitigation {rep.mitigation_date}:  "
                        f"before {s['before_mitigation']}, "
