@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The `CITATION.cff` abstract no longer lists a web shell among the
+  indicators. It now describes the current detection: the double-encoded
+  `__passthru` signature and the attacker-IP pivot.
+
 ## [1.1.0] - 2026-10-20
 
 > **Windows support is UNTESTED.** None of the Windows features have been run
