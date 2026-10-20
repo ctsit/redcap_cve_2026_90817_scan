@@ -2174,12 +2174,13 @@ def render_text(rep: Report, args) -> str:
     # On a provisional provider (Windows), remind the reader the host-state
     # checks are generic/unvalidated, so a clean host-state result is weaker.
     if rep.platform_name == "windows":
-        out.append("NOTE (Windows): host-state compromise checks are PROVISIONAL "
-                   "generic heuristics,")
-        out.append("      not the documented Linux campaign IOCs, and are not yet "
-                   "validated on")
-        out.append("      real hardware. The version and web-log findings are "
-                   "fully supported.")
+        out.append("NOTE (Windows): Windows support is UNTESTED -- it has never "
+                   "been run on a")
+        out.append("      Windows host or a real IIS log. Host-state checks are "
+                   "PROVISIONAL generic")
+        out.append("      heuristics, not the documented Linux campaign IOCs. "
+                   "Treat all results")
+        out.append("      on this platform as unverified.")
         out.append("")
 
     # Only suggest remediation when there is actually something to remediate.

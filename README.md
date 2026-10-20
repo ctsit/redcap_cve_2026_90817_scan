@@ -37,7 +37,8 @@ It is intended for an administrator running it against **their own** REDCap serv
   `authorized_keys` and `/proc/<pid>/exe`, and some logs are otherwise
   unreadable). Without root it still runs and clearly marks the result as a
   partial scan.
-- **Windows** (REDCap on IIS or Apache/XAMPP): **best-effort** — see
+- **Windows** (REDCap on IIS or Apache/XAMPP): **untested** — it has never
+  been run on a Windows host. See
   [Platforms & Windows support](#platforms--windows-support). Run from an
   **elevated** PowerShell/cmd for a complete scan.
 
@@ -279,13 +280,17 @@ web-server logs — is byte-for-byte identical on both.
 - **Linux** — fully supported and matches the **documented** Unit 42 campaign
   IOCs (ELF XMRig miner, `syslog-ng-<hash>` masquerade, Monero wallet on a
   command line, cron persistence, SSH backdoor key).
-- **Windows** — **best-effort and not yet validated on real hardware.** The
-  documented campaign is Linux-only, so a Windows REDCap host exploited through
-  the *same* CVE would almost certainly get a *different* post-exploitation
-  payload. Accordingly:
+- **Windows** — **UNTESTED.** No part of the Windows support has been run on a
+  Windows host or against a real IIS log. It has only been exercised by unit
+  tests on macOS, with a hand-written IIS log and a fake host provider. Treat
+  every Windows result as unverified. Also note that the documented campaign is
+  Linux-only, so a Windows REDCap host exploited through the *same* CVE would
+  almost certainly get a *different* post-exploitation payload. Accordingly:
   - The **"am I vulnerable?"** (version) and **"am I being attacked?"**
-    (web-log signature, including IIS W3C logs) answers are **first-class** and
-    shared with Linux.
+    (web-log signature) checks use the same detection code as Linux. The
+    Windows-specific parts are untested: finding the log directories, and
+    parsing real IIS W3C logs, which may have more `#Fields:` columns or
+    different encodings than the test fixture.
   - The **"am I compromised?"** host-state checks are **PROVISIONAL / generic
     heuristics** (a miner process or its `:50001` local API listener, a
     Scheduled Task running a PowerShell/`certutil` download cradle, a new admin
