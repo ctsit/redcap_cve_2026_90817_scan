@@ -41,8 +41,8 @@ keywords:
   - threat detection
   - xmrig
 license: Apache-2.0
-version: 1.0.0
-date-released: '2026-10-16'
+version: 1.1.0
+date-released: '2026-10-20'
 doi: 10.5281/zenodo.23426068
 references:
   - type: article

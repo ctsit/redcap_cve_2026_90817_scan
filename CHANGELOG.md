@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-20
+
 > **Windows support is UNTESTED.** None of the Windows features have been run
 > on a Windows host or against a real IIS log. Everything Windows-specific has
 > only been checked by unit tests run on macOS, using a hand-written IIS log
@@ -113,5 +115,6 @@ survey-endpoint RCE used in the XMRig campaign reported by Unit 42).
   template output, so flagging them overstated compromise.
 - Apache logs on RHEL/CentOS (`/var/log/httpd`) are now found.
 
-[Unreleased]: https://github.com/ctsit/redcap_cve_2026_90817_scan/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/ctsit/redcap_cve_2026_90817_scan/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/ctsit/redcap_cve_2026_90817_scan/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/ctsit/redcap_cve_2026_90817_scan/releases/tag/v1.0.0
