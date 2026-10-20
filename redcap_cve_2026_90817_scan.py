@@ -106,6 +106,23 @@ from typing import Iterable, Optional, Tuple
 # --------------------------------------------------------------------------- #
 
 IOC_SOURCE_IP = "202.61.130.221"            # exploit source
+# Attacker IPs OBSERVED in the wild at UF (October 2026), not in the Unit 42
+# report: each issued exploit-shaped requests against a UF REDCap host. They
+# are treated exactly like IOC_SOURCE_IP (recon in logs; HIGH on a live socket,
+# cron or profile reference). Most are cloud hosts that can be reassigned, so
+# the provenance is shown in evidence -- review and prune entries that go stale.
+# (The survey hashes these attackers used are deliberately NOT IOCs: they are the
+# target site's real surveys, so matching them would flag genuine respondents.)
+IOC_OBSERVED_IPS = {
+    "72.167.149.182": "observed 2026-10-14 (UF): python-requests probe + ParcelController",
+    "18.163.208.19": "observed 2026-10-15 (UF): python-requests probe + ParcelController",
+    "159.65.159.30": "observed 2026-10-19 (UF): fake-UA ParcelController",
+    "45.225.183.6": "observed 2026-10-19 (UF): fake-UA ParcelController",
+    "159.89.115.81": "observed 2026-10-19 (UF): fake-UA ParcelController",
+    "165.22.168.95": "observed 2026-10-19 (UF): fake-UA ParcelController",
+    "5.180.77.102": "observed 2026-10-19 (UF): DataImportController, doubled-path probe",
+}
+DEFAULT_ATTACKER_IPS = [IOC_SOURCE_IP] + list(IOC_OBSERVED_IPS)
 IOC_POOL_DOMAIN = "auto.c3pool.org"         # mining pool
 IOC_DROPPER_SHA256 = (
     "39a435123dc1fffd499aa2acf11ef46e3ee2e805bf137811af0c2c5b12546920"
@@ -161,6 +178,19 @@ INTERNAL_CONTROLLER_RE = re.compile(r"route=([a-z0-9_]+controller)\b", re.IGNORE
 # reached by an exploit-shaped request that is NOT listed here is surfaced as a
 # candidate IOC by the second-pass attacker pivot (check_attacker_pivot).
 KNOWN_EXPLOIT_CONTROLLERS = {"dataimportcontroller", "parcelcontroller"}
+# Campaign reconnaissance patterns (observed at UF, October 2026). Both are
+# classified as recon from ANY source IP -- not exploitation on their own:
+#   * a doubled survey path that 404s (/redcap/surveys/surveys?s=...,
+#     /redcap/surveys/redcap/surveys/, /redcap/redcap/surveys/) -- a path-
+#     joining bug in the attack tool, seen from two IPs sharing a target list;
+#   * a tool-generated user agent with a datetime inside the Gecko token
+#     (e.g. "Gecko/8618-10-13 16:07:47.714447 Firefox/3.8"), as Python Faker
+#     generates; real browsers send e.g. "Gecko/20100101". Only flagged on a
+#     /surveys request. Other made-up UAs (e.g. Chrome/39 on AppleWebKit/532)
+#     are not detectable this way.
+# Not IOCs: python-requests (too generic) and the 5-byte 2xx response (that is
+# reachability, already ranked by HTTP status).
+FAKE_UA_RE = re.compile(r"Gecko/\d{1,4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
 
 # Patched releases and affected floor (public threat-intel; confirm vs. vendor).
 FIXED_VERSIONS = {
@@ -242,7 +272,7 @@ class Report:
     privileged: bool = False                 # provider-reported privilege level
     platform_name: str = ""                  # active provider (linux/windows/...)
     # Attacker IPs known before the scan: the documented IOC plus --attacker-ip.
-    known_attacker_ips: list = field(default_factory=lambda: [IOC_SOURCE_IP])
+    known_attacker_ips: list = field(default_factory=lambda: list(DEFAULT_ATTACKER_IPS))
     ip_activity: dict = field(default_factory=dict)   # per-IP raw aggregates
     candidate_iocs: list = field(default_factory=list)
     log_since: Optional[datetime.date] = None   # --since: inclusive log window
@@ -638,6 +668,16 @@ def _dedup(items: list) -> list:
     return out
 
 
+def _is_doubled_survey_path(path: str) -> bool:
+    """True for the attack tool's path-join bug: `surveys` appears twice
+    (/redcap/surveys/surveys, /redcap/surveys/redcap/surveys) or a segment is
+    immediately repeated in a survey path (/redcap/redcap/surveys)."""
+    segs = [x for x in path.lower().split("/") if x]
+    if segs.count("surveys") >= 2:
+        return True
+    return "surveys" in segs and any(a == b for a, b in zip(segs, segs[1:]))
+
+
 def _classify_log_line(line: str, known_ips: Iterable = (IOC_SOURCE_IP,)) -> tuple:
     """Classify a web-server access-log line for CVE-2026-90817.
 
@@ -687,7 +727,19 @@ def _classify_log_line(line: str, known_ips: Iterable = (IOC_SOURCE_IP,)) -> tup
     # Known attacker source IP(s). Not exploit-shaped on its own -> reconnaissance.
     for ip in known_ips:
         if ip in line:
-            recon.append(f"contact from known attacker IP {ip}")
+            why = IOC_OBSERVED_IPS.get(ip)
+            recon.append(f"contact from known attacker IP {ip}"
+                         + (f" ({why})" if why else ""))
+    # Campaign probe patterns from any IP (see the IOC block). Cheap substring
+    # pre-checks keep the per-line cost down on large logs.
+    if '" 404 ' in line and "surveys" in line:
+        _m, path, _q, _ua = _parse_request_fields(line)
+        if path and _is_doubled_survey_path(path):
+            recon.append("doubled survey path (campaign path-join bug)")
+    if "Gecko/" in line and FAKE_UA_RE.search(line):
+        _m, path, _q, _ua = _parse_request_fields(line)
+        if path and "/surveys" in path:
+            recon.append("tool-generated user agent (timestamp in Gecko token)")
 
     return (_dedup(exploit), _dedup(recon))
 
@@ -724,11 +776,9 @@ def _fold_line(agg: dict, line: str, status, size, dt, tstr: str,
             agg["last_dt"] = dt
     if status:
         agg["statuses"][status] = agg["statuses"].get(status, 0) + 1
-    if ("surveys/redcap/surveys" in line or
-            "surveys/surveys" in line) and status == "404":
-        agg["doubled_path_404"] += 1
-
     method, path, query, ua = _parse_request_fields(line)
+    if status == "404" and path and _is_doubled_survey_path(path):
+        agg["doubled_path_404"] += 1
     if ua and ua != "-":
         _note_feature(agg, "user-agent", ua, dt)
     if method and method != "GET":
@@ -1729,8 +1779,8 @@ def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
         exploit_ev.append(f"... (+{exploit_total - max_matches} more exploit-shaped "
                           "request(s); pass --max-log-matches all to list every one)")
     if not unlimited and recon_total > max_matches:
-        recon_ev.append(f"... (+{recon_total - max_matches} more request(s) from the "
-                        "attacker IP; pass --max-log-matches all to list every one)")
+        recon_ev.append(f"... (+{recon_total - max_matches} more reconnaissance "
+                        "request(s); pass --max-log-matches all to list every one)")
 
     if exploit_ev:
         detail = ("Request(s) reaching an internal controller via the "
@@ -1755,11 +1805,12 @@ def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
                         detail, evidence=exploit_ev))
     if recon_ev:
         rep.add(Finding(SEV_MEDIUM, "weblog",
-                        "Traffic from known attacker source IP(s) "
-                        f"({', '.join(rep.known_attacker_ips)})",
-                        "Request(s) from a documented (or --attacker-ip) source IP that "
-                        "were NOT "
-                        "exploit-shaped (e.g. GET / or /surveys/ probes) -- most likely "
+                        "Reconnaissance: known attacker IPs or campaign probe "
+                        "patterns",
+                        "Request(s) that were NOT exploit-shaped but come from a "
+                        "documented, observed or --attacker-ip source IP, or match a "
+                        "campaign probe pattern (a doubled survey path that 404s, or "
+                        "a tool-generated user agent on a survey URL) -- most likely "
                         "reconnaissance. Worth noting that the host was targeted, but "
                         "not evidence of exploitation on its own.",
                         evidence=recon_ev))
@@ -2288,7 +2339,7 @@ def run_scan(args, host: HostProvider) -> Report:
         except ValueError:
             raise ValueError(f"--attacker-ip must be an IP address (got {ip!r})")
     rep.known_attacker_ips = _dedup(
-        [IOC_SOURCE_IP] + list(getattr(args, "attacker_ip", None) or []))
+        DEFAULT_ATTACKER_IPS + list(getattr(args, "attacker_ip", None) or []))
 
     # How many attack log entries to list (verbatim); 'all' = unlimited.
     _mlm = args.max_log_matches.strip().lower()

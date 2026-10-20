@@ -111,8 +111,8 @@ Each documented IOC maps to a passive local check:
 - **Processes** — miners (XMRig / pool / wallet references), executables running
   from `/var/tmp`, `/dev/shm`, `/tmp`, and `syslog-ng-*` masquerading processes.
 - **Sockets** — the local XMRig JSON-RPC API on `127.0.0.1:50001`, and live
-  connections to the attacker source IP(s) — the documented one, any
-  `--attacker-ip`, and every IP the web-log check discovered.
+  connections to the attacker source IP(s) — the documented one, the
+  observed ones, any `--attacker-ip`, and every IP the web-log check discovered.
 - **Cron persistence** — fetch-to-shell cradles and IOC references in system and
   per-user crontabs.
 - **SSH `authorized_keys`** — keys matching the attacker's backdoor fingerprint.
@@ -139,8 +139,42 @@ is treated as **exploit-shaped** only when it shows:
   hosts *other than* the one documented IOC IP; or
 - the specific attacker **survey hash** from the report.
 
-Traffic merely **from the known attacker source IP** is classified separately as
-reconnaissance (MEDIUM), not as an exploit-shaped request.
+Some requests are classified separately as **reconnaissance** (MEDIUM), not as
+exploit-shaped requests:
+
+- Any request from a **known attacker IP**: the documented IOC IP, any
+  `--attacker-ip`, or the observed IPs below.
+- A **doubled survey path that 404s**, from any IP. Examples:
+  `/redcap/surveys/surveys?s=…`, `/redcap/surveys/redcap/surveys/`,
+  `/redcap/redcap/surveys/`. This is a path-joining bug in the attack tool.
+- A **tool-generated user agent** on a `/surveys` request, from any IP. This
+  means a datetime inside the Gecko token, such as
+  `Gecko/8618-10-13 16:07:47.714447 Firefox/3.8`, the kind of string Python
+  Faker generates. Real browsers send e.g. `Gecko/20100101`.
+
+#### Observed attacker IPs (not in the Unit 42 report)
+
+These IPs sent exploit-shaped requests to a UF REDCap host in October 2026.
+They are treated exactly like the documented IP:
+- their log traffic is reconnaissance (MEDIUM);
+- a live socket, cron or profile reference to one of them is HIGH.
+
+| IP | First seen | Behaviour |
+|----|-----------|-----------|
+| 72.167.149.182 | 2026-10-14 | `python-requests`; base-path probe, then ParcelController |
+| 18.163.208.19 | 2026-10-15 | `python-requests`; base-path probe, then ParcelController |
+| 159.65.159.30, 45.225.183.6, 159.89.115.81, 165.22.168.95 | 2026-10-19 | made-up user agents, paired IPs; ParcelController |
+| 5.180.77.102 | 2026-10-19 | DataImportController; same survey targets and doubled-path bug as 202.61.130.221 |
+
+Most are cloud hosts that can be reassigned, so each evidence line shows where
+the IP came from. Remove entries from `IOC_OBSERVED_IPS` when they go stale.
+
+The following were seen in the same traffic but are **not** IOCs:
+- The **survey hashes** the attackers targeted: they are the site's real
+  surveys, so matching them would flag genuine respondents.
+- **`python-requests`**: too generic.
+- The **5-byte 2xx response**: it shows the request reached the controller,
+  which is already ranked by HTTP status.
 
 Because detection is by request *pattern*, not by IP, the scanner **aggregates every
 distinct source IP** that issued an exploit-shaped request and calls out any beyond

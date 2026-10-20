@@ -367,7 +367,7 @@ class AttackerPivotTests(unittest.TestCase):
         rep = self._scan(attacker_ip=["198.51.100.10"])
         self.assertNotIn("198.51.100.10", self._candidates(rep, "ip"))
         recon = [f for f in findings_by_check(rep)["weblog"]
-                 if f.title.startswith("Traffic from known")]
+                 if f.title.startswith("Reconnaissance")]
         self.assertTrue(any("POST /redcap/api/" in e for e in recon[0].evidence))
 
     def test_bad_attacker_ip_rejected(self):
@@ -383,6 +383,54 @@ class AttackerPivotTests(unittest.TestCase):
         out, _mapping, _hosts = san.sanitize(text, [], "redcap.example.org",
                                              random.Random(0))
         self.assertNotIn("SHAREDHSH1", out)
+
+
+class ObservedIocTests(unittest.TestCase):
+    """IOCs added from the UF scan of 2026-10-20 (scan_result_7)."""
+
+    FAKE_UA = ("Mozilla/5.0 (X11; Linux i686; rv:1.9.5.20) "
+               "Gecko/8618-10-13 16:07:47.714447 Firefox/3.8")
+
+    def _line(self, path, status="404", ua="Mozilla/5.0", ip="198.51.100.77"):
+        return (f'{ip} - - [19/Oct/2026:10:06:05 -0400] "GET {path} HTTP/1.1" '
+                f'{status} 322 "-" "{ua}"')
+
+    def _recon(self, line):
+        return scan._classify_log_line(line, scan.DEFAULT_ATTACKER_IPS)[1]
+
+    def test_observed_ips_are_known_by_default(self):
+        known = scan.Report().known_attacker_ips
+        for ip in ("72.167.149.182", "18.163.208.19", "159.65.159.30",
+                   "45.225.183.6", "159.89.115.81", "165.22.168.95",
+                   "5.180.77.102"):
+            self.assertIn(ip, known)
+        rc = self._recon(self._line("/redcap/", "200", ip="18.163.208.19"))
+        self.assertTrue(any("observed" in r for r in rc), rc)
+
+    def test_socket_to_observed_ip_is_high(self):
+        rep = scan.Report()
+        host = FakeProvider(sockets=[
+            scan.SockInfo("tcp", "10.0.0.2", 55000, "5.180.77.102", 443, "ESTAB")])
+        scan.check_sockets(rep, host)
+        socks = findings_by_check(rep).get("socket", [])
+        self.assertTrue(any(f.severity == scan.SEV_HIGH for f in socks))
+
+    def test_doubled_survey_path(self):
+        doubled = "doubled survey path (campaign path-join bug)"
+        self.assertIn(doubled, self._recon(self._line("/redcap/surveys/surveys?s=X")))
+        self.assertIn(doubled, self._recon(self._line("/redcap/redcap/surveys/")))
+        self.assertIn(doubled,
+                      self._recon(self._line("/redcap/surveys/redcap/surveys/?s=X")))
+        self.assertEqual(self._recon(self._line("/redcap/surveys/surveys?s=X", "200")), [])
+        self.assertEqual(self._recon(self._line("/redcap/surveys/?s=X")), [])
+
+    def test_fake_user_agent(self):
+        fake = "tool-generated user agent (timestamp in Gecko token)"
+        self.assertIn(fake, self._recon(self._line("/surveys/?s=X", ua=self.FAKE_UA)))
+        self.assertEqual(self._recon(self._line("/redcap/", "200", ua=self.FAKE_UA)), [])
+        real = ("Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 "
+                "Firefox/131.0")
+        self.assertEqual(self._recon(self._line("/surveys/?s=X", "200", ua=real)), [])
 
 
 class LogWindowTests(unittest.TestCase):
