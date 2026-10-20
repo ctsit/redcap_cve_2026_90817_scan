@@ -23,14 +23,16 @@ abstract:
   to and compromise by CVE-2026-90817, the unauthenticated survey-endpoint
   remote-code-execution vulnerability abused by the XMRig cryptomining
   campaign. It compares the installed REDCap version against the patched
-  releases and hunts the documented indicators of compromise (web shell,
-  miner staging, masquerading processes, local miner API, attacker-IP
-  connections, cron/SSH/profile persistence, and anti-forensics) without
-  sending any HTTP requests or reproducing the exploit. It distinguishes
-  the DataImportController-via-survey-passthru attack hallmark from
-  legitimate REDCap traffic and correlates attack timestamps in the
-  web-server logs against the mitigation date to judge compromise
-  likelihood.
+  releases and hunts the documented indicators of compromise (known
+  dropper file hash, miner staging, masquerading processes, local miner
+  API, attacker-IP connections, cron/SSH/profile persistence, and
+  anti-forensics) without sending any HTTP requests or reproducing the
+  exploit. It distinguishes exploit-shaped survey-passthru requests (the
+  DataImportController sink, or any controller reached through a
+  double-encoded index.php) from legitimate REDCap traffic, feeds the
+  attacker IPs it finds back through the logs and host state, and
+  correlates attack timestamps in the web-server logs against the
+  mitigation date to judge compromise likelihood.
 keywords:
   - redcap
   - security
