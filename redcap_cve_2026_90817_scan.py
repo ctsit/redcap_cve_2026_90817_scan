@@ -85,6 +85,7 @@ import datetime
 import glob
 import gzip
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -154,6 +155,10 @@ MINER_CMD_TOKENS = ("xmrig", "c3pool", "stratum+tcp", IOC_POOL_DOMAIN.lower(),
 IOC_ATTACKER_SURVEY_HASH = "s=NXCJMDCWXE"   # specific hash from the report sample
 # Extract the internal controller a request routes to (for reporting).
 INTERNAL_CONTROLLER_RE = re.compile(r"route=([a-z0-9_]+controller)\b", re.IGNORECASE)
+# Controllers already observed as exploit targets (lowercase). A controller
+# reached by an exploit-shaped request that is NOT listed here is surfaced as a
+# candidate IOC by the second-pass attacker pivot (check_attacker_pivot).
+KNOWN_EXPLOIT_CONTROLLERS = {"dataimportcontroller", "parcelcontroller"}
 
 # Patched releases and affected floor (public threat-intel; confirm vs. vendor).
 FIXED_VERSIONS = {
@@ -234,6 +239,10 @@ class Report:
     attack_summary: Optional[dict] = None    # log-attack counts / timing
     privileged: bool = False                 # provider-reported privilege level
     platform_name: str = ""                  # active provider (linux/windows/...)
+    # Attacker IPs known before the scan: the documented IOC plus --attacker-ip.
+    known_attacker_ips: list = field(default_factory=lambda: [IOC_SOURCE_IP])
+    ip_activity: dict = field(default_factory=dict)   # per-IP raw aggregates
+    candidate_iocs: list = field(default_factory=list)
 
     def add(self, f: Finding) -> None:
         self.findings.append(f)
@@ -444,6 +453,25 @@ def _parse_clf_fields(line: str):
     return (ip, status, size)
 
 
+_REQUEST_RE = re.compile(r'"([A-Z]+) (\S+) HTTP/[\d.]+"')
+_LAST_QUOTED_RE = re.compile(r'"([^"]*)"\s*$')
+
+
+def _parse_request_fields(line: str):
+    """Best-effort extract (method, path, query, user_agent) from a combined-log
+    line. The query is returned raw (still URL-encoded) so encoding variants
+    survive. Returns None for any field that cannot be parsed; never raises."""
+    method = path = query = ua = None
+    m = _REQUEST_RE.search(line)
+    if m:
+        method = m.group(1)
+        path, _, query = m.group(2).partition("?")
+    m = _LAST_QUOTED_RE.search(line)       # combined log: UA is the last field
+    if m:
+        ua = m.group(1)
+    return (method, path, query, ua)
+
+
 # --------------------------------------------------------------------------- #
 # W3C Extended log format (IIS) -> synthetic CLF adapter
 # --------------------------------------------------------------------------- #
@@ -606,7 +634,7 @@ def _dedup(items: list) -> list:
     return out
 
 
-def _classify_log_line(line: str) -> tuple:
+def _classify_log_line(line: str, known_ips: Iterable = (IOC_SOURCE_IP,)) -> tuple:
     """Classify a web-server access-log line for CVE-2026-90817.
 
     Returns (exploit_reasons, recon_reasons).
@@ -652,22 +680,114 @@ def _classify_log_line(line: str) -> tuple:
     if IOC_ATTACKER_SURVEY_HASH.lower() in line.lower():
         exploit.append(f"attacker survey hash {IOC_ATTACKER_SURVEY_HASH}")
 
-    # Known attacker source IP. Not exploit-shaped on its own -> reconnaissance.
-    if IOC_SOURCE_IP in line:
-        recon.append(f"contact from known attacker IP {IOC_SOURCE_IP}")
+    # Known attacker source IP(s). Not exploit-shaped on its own -> reconnaissance.
+    for ip in known_ips:
+        if ip in line:
+            recon.append(f"contact from known attacker IP {ip}")
 
     return (_dedup(exploit), _dedup(recon))
 
 
-def _line_is_suspicious(line: str, extra_res: Iterable) -> bool:
+def _new_ip_agg(tstr: str) -> dict:
+    """Empty per-source-IP behaviour aggregate. `features` maps
+    (kind, value) -> [count, first_dt, last_dt] and feeds the candidate-IOC
+    diff; the rest is the per-IP summary."""
+    return {"exploit": 0, "recon": 0, "other": 0, "statuses": {},
+            "doubled_path_404": 0, "first": tstr, "last": tstr,
+            "first_dt": None, "last_dt": None, "features": {}}
+
+
+def _note_feature(agg: dict, kind: str, value: str, dt) -> None:
+    rec = agg["features"].setdefault((kind, value), [0, dt, dt])
+    rec[0] += 1
+    if dt is not None:
+        if rec[1] is None or dt < rec[1]:
+            rec[1] = dt
+        if rec[2] is None or dt > rec[2]:
+            rec[2] = dt
+
+
+def _fold_line(agg: dict, line: str, status, size, dt, tstr: str,
+               is_exploit: bool) -> None:
+    """Fold one attacker log line into its IP's aggregate: status/timing plus
+    the features (user agent, survey hash, controller, request shape, ...) that
+    show how the attack tooling changes over time."""
+    agg["last"] = tstr
+    if dt is not None:
+        if agg["first_dt"] is None or dt < agg["first_dt"]:
+            agg["first_dt"] = dt
+        if agg["last_dt"] is None or dt > agg["last_dt"]:
+            agg["last_dt"] = dt
+    if status:
+        agg["statuses"][status] = agg["statuses"].get(status, 0) + 1
+    if ("surveys/redcap/surveys" in line or
+            "surveys/surveys" in line) and status == "404":
+        agg["doubled_path_404"] += 1
+
+    method, path, query, ua = _parse_request_fields(line)
+    if ua and ua != "-":
+        _note_feature(agg, "user-agent", ua, dt)
+    if method and method != "GET":
+        _note_feature(agg, "method", method, dt)
+    if not is_exploit:
+        if path:
+            _note_feature(agg, "path", path, dt)
+        return
+    m = INTERNAL_CONTROLLER_RE.search(_url_unquote_recursive(line))
+    if m:
+        _note_feature(agg, "controller", m.group(1), dt)
+    if query:
+        m = re.search(r"(?:^|&)s=([A-Za-z0-9]+)", query)
+        if m:
+            # `?s=` prefix keeps sanitize_scan_result.py's hash mapping effective.
+            _note_feature(agg, "survey-hash", f"?s={m.group(1)}", dt)
+        # Query with the survey hash masked: preserves the encoding variant
+        # (`:` vs `%3A`, `%2569ndex.php`, ...) so tooling changes stand out.
+        shape = re.sub(r"(^|&)s=[^&]*", r"\1s=<hash>", query)
+        _note_feature(agg, "exploit-shape", f"{path}?{shape}", dt)
+    if status and status.startswith("2") and size is not None:
+        _note_feature(agg, "2xx-size", str(size), dt)
+
+
+def _iso(dt) -> Optional[str]:
+    return dt.isoformat() if dt is not None else None
+
+
+def _summarize_ip(a: dict) -> dict:
+    """JSON-safe per-IP summary for attack_summary['by_ip']."""
+    def values(kind):
+        return sorted(v for (k, v) in a["features"] if k == kind)
+    return {
+        "exploit": a["exploit"],
+        "recon": a["recon"],
+        "other": a["other"],
+        "controllers": values("controller"),
+        "statuses": a["statuses"],
+        "doubled_path_404": a["doubled_path_404"],
+        "first": a["first"],
+        "last": a["last"],
+        "first_seen": _iso(a["first_dt"]),
+        "last_seen": _iso(a["last_dt"]),
+        "user_agents": values("user-agent"),
+        "survey_hashes": values("survey-hash"),
+        "methods": values("method"),
+    }
+
+
+def _mentions_ip(line: str, ips: Iterable) -> bool:
+    return any(ip in line for ip in ips)
+
+
+def _line_is_suspicious(line: str, extra_res: Iterable,
+                        known_ips: Iterable = (IOC_SOURCE_IP,)) -> bool:
     """True if a cron/profile/task line matches a fetch-to-shell cradle (the
     provider supplies the platform-appropriate regex[es]) or references a known
-    cross-platform IOC (pool domain, source IP, payload filename)."""
+    cross-platform IOC (pool domain, attacker IP, payload filename)."""
     low = line.lower()
     for rx in extra_res:
         if rx.search(line):
             return True
-    if IOC_POOL_DOMAIN in low or IOC_SOURCE_IP in line:
+    if IOC_POOL_DOMAIN in low or _mentions_ip(line, known_ips):
         return True
     if any(name in low for name in (n.lower() for n in IOC_PAYLOAD_NAMES)):
         return True
@@ -1354,7 +1474,7 @@ def check_sockets(rep: Report, host: HostProvider) -> None:
         if s.state == "LISTEN" and s.lport == IOC_MINER_API_PORT and \
                 s.laddr in ("127.0.0.1", "::1", "0.0.0.0", "::"):
             listen.append(f"{s.proto} LISTEN {s.laddr}:{s.lport}")
-        if s.raddr == IOC_SOURCE_IP:
+        if s.raddr in rep.known_attacker_ips:
             connected.append(f"{s.proto} {s.state} -> {s.raddr}:{s.rport}")
     if listen:
         rep.add(Finding(SEV_HIGH, "socket",
@@ -1363,8 +1483,9 @@ def check_sockets(rep: Report, host: HostProvider) -> None:
                         evidence=listen))
     if connected:
         rep.add(Finding(SEV_HIGH, "socket",
-                        f"Active connection involving exploit source {IOC_SOURCE_IP}",
-                        "Current socket to/from the documented attacker IP.",
+                        "Active connection involving a known attacker IP",
+                        "Current socket to/from a documented (or --attacker-ip) "
+                        "attacker IP.",
                         evidence=connected))
 
 
@@ -1379,7 +1500,7 @@ def check_cron(rep: Report, host: HostProvider) -> None:
         for lineno, line in enumerate(job.lines, 1):
             if not line.strip() or line.lstrip().startswith("#"):
                 continue
-            if _line_is_suspicious(line, res):
+            if _line_is_suspicious(line, res, rep.known_attacker_ips):
                 evidence.append(f"{job.source}:{lineno}: {line.strip()[:200]}")
     if evidence:
         rep.add(Finding(SEV_HIGH, "cron",
@@ -1440,7 +1561,7 @@ def check_profiles(rep: Report, host: HostProvider, homes: list) -> None:
         for lineno, line in enumerate(lines, 1):
             if not line.strip() or line.lstrip().startswith("#"):
                 continue
-            if _line_is_suspicious(line, res):
+            if _line_is_suspicious(line, res, rep.known_attacker_ips):
                 evidence.append(f"{path}:{lineno}: {line.strip()[:200]}")
     histfile_hits = host.history_suppression(homes)
     if evidence:
@@ -1456,6 +1577,17 @@ def check_profiles(rep: Report, host: HostProvider, homes: list) -> None:
                         evidence=histfile_hits))
 
 
+def _access_log_files(log_dirs: list, host: HostProvider) -> list:
+    files = []
+    for d in log_dirs:
+        if not os.path.isdir(d):
+            continue
+        for pat in host.log_globs():
+            files += glob.glob(os.path.join(d, pat))
+            files += glob.glob(os.path.join(d, "**", pat), recursive=True)
+    return sorted(set(files))
+
+
 def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
                       mitigation_date=None, max_matches=MAX_LOG_MATCHES) -> None:
     # max_matches is how many example entries to list per category; None = all.
@@ -1465,14 +1597,7 @@ def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
     # transparently converts W3C rows to the combined-log shape, so everything
     # below is format-agnostic.
     unlimited = max_matches is None
-    files = []
-    for d in log_dirs:
-        if not os.path.isdir(d):
-            continue
-        for pat in host.log_globs():
-            files += glob.glob(os.path.join(d, pat))
-            files += glob.glob(os.path.join(d, "**", pat), recursive=True)
-    files = sorted(set(files))
+    files = _access_log_files(log_dirs, host)
     if not files:
         rep.note("No web-server access logs found; exploit-attempt check skipped. "
                  "Pass --log-dir if logs live elsewhere.")
@@ -1483,7 +1608,7 @@ def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
     before = on = after = undated = 0        # attack timing vs mitigation_date
     earliest = latest = None
     unreadable = 0
-    by_ip = {}                               # per-source-IP behaviour aggregate
+    by_ip = rep.ip_activity                  # per-source-IP behaviour aggregate
     for path in files:
         try:
             line_iter = iter_clf_lines(path)
@@ -1492,7 +1617,7 @@ def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
             continue
         try:
             for line in line_iter:
-                ex, rc = _classify_log_line(line)
+                ex, rc = _classify_log_line(line, rep.known_attacker_ips)
                 if not (ex or rc):
                     continue
                 dt = parse_apache_time(line)
@@ -1513,23 +1638,12 @@ def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
                         after += 1
 
                 ip, status, size = _parse_clf_fields(line)
-                agg = by_ip.setdefault(ip, {
-                    "exploit": 0, "recon": 0, "controllers": set(),
-                    "statuses": {}, "doubled_path_404": 0,
-                    "first": tstr, "last": tstr})
-                agg["last"] = tstr
-                if status:
-                    agg["statuses"][status] = agg["statuses"].get(status, 0) + 1
-                if ("surveys/redcap/surveys" in line or
-                        "surveys/surveys" in line) and status == "404":
-                    agg["doubled_path_404"] += 1
+                agg = by_ip.setdefault(ip, _new_ip_agg(tstr))
+                _fold_line(agg, line, status, size, dt, tstr, bool(ex))
 
                 if ex:
                     exploit_total += 1
                     agg["exploit"] += 1
-                    m = INTERNAL_CONTROLLER_RE.search(_url_unquote_recursive(line))
-                    if m:
-                        agg["controllers"].add(m.group(1))
                     # Rank by status: a 2xx means the passthru REACHED the
                     # controller unauthenticated -- reachability, NOT proof that
                     # code executed or that the host was compromised. Anything
@@ -1559,7 +1673,7 @@ def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
     # attackers" surfaced by pattern, not by the known IOC IP).
     exploit_ips = sorted(ip for ip, a in by_ip.items()
                          if ip and a["exploit"] > 0)
-    other_ips = [ip for ip in exploit_ips if ip != IOC_SOURCE_IP]
+    other_ips = [ip for ip in exploit_ips if ip not in rep.known_attacker_ips]
 
     total = exploit_total + recon_total
     if total:
@@ -1574,18 +1688,8 @@ def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
             "earliest": earliest.isoformat() if earliest else None,
             "latest": latest.isoformat() if latest else None,
             "distinct_exploit_ips": exploit_ips,
-            "by_ip": {
-                ip: {
-                    "exploit": a["exploit"],
-                    "recon": a["recon"],
-                    "controllers": sorted(a["controllers"]),
-                    "statuses": a["statuses"],
-                    "doubled_path_404": a["doubled_path_404"],
-                    "first": a["first"],
-                    "last": a["last"],
-                }
-                for ip, a in by_ip.items() if ip and a["exploit"] > 0
-            },
+            "by_ip": {ip: _summarize_ip(a) for ip, a in by_ip.items()
+                      if ip and a["exploit"] > 0},
         }
 
     if not unlimited and exploit_total > max_matches:
@@ -1609,22 +1713,188 @@ def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
             detail += (f" Distinct source IP(s) issuing exploit-shaped requests: "
                        f"{', '.join(exploit_ips)}.")
         if other_ips:
-            detail += (f" NOTE: {len(other_ips)} source IP(s) beyond the documented "
-                       f"IOC ({IOC_SOURCE_IP}) issued exploit-shaped requests: "
+            detail += (f" NOTE: {len(other_ips)} source IP(s) beyond the known "
+                       f"attacker IP(s) ({', '.join(rep.known_attacker_ips)}) "
+                       "issued exploit-shaped requests: "
                        f"{', '.join(other_ips)}.")
         rep.add(Finding(SEV_HIGH, "weblog",
                         "CVE-2026-90817 exploit-attempt signature in access logs",
                         detail, evidence=exploit_ev))
     if recon_ev:
         rep.add(Finding(SEV_MEDIUM, "weblog",
-                        f"Traffic from the known attacker source IP ({IOC_SOURCE_IP})",
-                        "Request(s) from the documented exploit source IP that were NOT "
+                        "Traffic from known attacker source IP(s) "
+                        f"({', '.join(rep.known_attacker_ips)})",
+                        "Request(s) from a documented (or --attacker-ip) source IP that "
+                        "were NOT "
                         "exploit-shaped (e.g. GET / or /surveys/ probes) -- most likely "
                         "reconnaissance. Worth noting that the host was targeted, but "
                         "not evidence of exploitation on its own.",
                         evidence=recon_ev))
     if unreadable and not host.is_privileged():
         rep.note(f"{unreadable} log file(s) unreadable without privilege; log check partial.")
+
+
+# Why each candidate-IOC kind is surfaced, in display order.
+CANDIDATE_KINDS = [
+    ("ip", "exploit-shaped requests from an IP not yet in the IOC list"),
+    ("controller", "controller reached by exploit-shaped requests, not in "
+                   "KNOWN_EXPLOIT_CONTROLLERS"),
+    ("survey-hash", "survey hash used in exploit requests by 2+ attacker IPs "
+                    "(shared target list)"),
+    ("user-agent", "user agent shared by 2+ attacker IPs"),
+    ("exploit-shape", "distinct exploit request shape (survey hash masked); "
+                      "tracks encoding/tooling changes"),
+    ("2xx-size", "response size recurring across 2xx exploit hits"),
+    ("method", "non-GET method from an attacker IP"),
+    ("path", "non-exploit path requested by attacker IPs"),
+]
+
+
+def check_attacker_pivot(rep: Report, log_dirs: list, host: HostProvider,
+                         homes: list, max_matches=MAX_LOG_MATCHES) -> None:
+    """Second pass: feed the attacker IPs discovered by request PATTERN in
+    check_access_logs back through the logs and the host state.
+
+      a. Re-read the access logs for every other request those IPs made
+         (probes, follow-ups) -- the first pass keeps only exploit-shaped lines
+         and lines from already-known attacker IPs.
+      b. Look for the discovered IPs in sockets, scheduled jobs and startup
+         files, which the first pass checked only for the known IPs.
+      c. Diff the per-IP features against what the scanner already knows and
+         record what is new in rep.candidate_iocs, for HUMAN review. Nothing
+         here changes the IOC constants."""
+    s = rep.attack_summary or {}
+    new_ips = sorted(ip for ip in s.get("distinct_exploit_ips", [])
+                     if ip not in rep.known_attacker_ips)
+    if new_ips:
+        _pivot_logs(rep, log_dirs, host, set(new_ips), max_matches)
+        _pivot_host_state(rep, host, homes, new_ips)
+    rep.candidate_iocs = _candidate_iocs(rep)
+    if rep.attack_summary:
+        rep.attack_summary["by_ip"] = {
+            ip: _summarize_ip(a) for ip, a in rep.ip_activity.items()
+            if ip and a["exploit"] > 0}
+
+
+def _pivot_logs(rep: Report, log_dirs: list, host: HostProvider,
+                pivot_ips: set, max_matches) -> None:
+    unlimited = max_matches is None
+    evidence, total = [], 0
+    for path in _access_log_files(log_dirs, host):
+        try:
+            for line in iter_clf_lines(path):
+                ip, status, size = _parse_clf_fields(line)
+                if ip not in pivot_ips:
+                    continue
+                ex, rc = _classify_log_line(line, rep.known_attacker_ips)
+                if ex or rc:
+                    continue                 # already counted by the first pass
+                dt = parse_apache_time(line)
+                tstr = dt.date().isoformat() if dt else "undated"
+                agg = rep.ip_activity.setdefault(ip, _new_ip_agg(tstr))
+                agg["other"] += 1
+                _fold_line(agg, line, status, size, dt, tstr, False)
+                total += 1
+                if unlimited or len(evidence) < max_matches:
+                    evidence.append(f"{path} [{tstr}]: [other traffic from "
+                                    f"attacker IP {ip}] {line.strip()}")
+        except Exception:
+            continue     # unreadable files were already noted by the first pass
+    if not total:
+        return
+    if not unlimited and total > max_matches:
+        evidence.append(f"... (+{total - max_matches} more request(s); pass "
+                        "--max-log-matches all to list every one)")
+    rep.add(Finding(SEV_MEDIUM, "weblog",
+                    f"Other traffic from {len(pivot_ips)} attacker IP(s) "
+                    "discovered by pattern",
+                    "Second pass: every non-exploit-shaped request from the IPs "
+                    "that issued exploit-shaped requests -- reconnaissance, path "
+                    "guessing and any follow-up activity. Read these for attack "
+                    "methods the signatures do not cover yet; see Candidate IOCs.",
+                    evidence=evidence))
+
+
+def _pivot_host_state(rep: Report, host: HostProvider, homes: list,
+                      ips: list) -> None:
+    title_ips = ", ".join(ips)
+    if host.can_enumerate_sockets():
+        connected = [f"{s.proto} {s.state} -> {s.raddr}:{s.rport}"
+                     for s in host.iter_sockets() if s.raddr in ips]
+        if connected:
+            rep.add(Finding(SEV_HIGH, "socket",
+                            "Active connection involving an attacker IP "
+                            "discovered in web logs",
+                            f"Current socket to/from an IP that issued "
+                            f"exploit-shaped requests ({title_ips}).",
+                            evidence=connected))
+    jobs = []
+    for job in host.iter_scheduled_jobs():
+        for lineno, line in enumerate(job.lines or [], 1):
+            if not line.lstrip().startswith("#") and _mentions_ip(line, ips):
+                jobs.append(f"{job.source}:{lineno}: {line.strip()[:200]}")
+    if jobs:
+        rep.add(Finding(SEV_HIGH, "cron",
+                        "Scheduled-job entry references an attacker IP "
+                        "discovered in web logs",
+                        f"Cron/scheduled-task content mentions an IP that issued "
+                        f"exploit-shaped requests ({title_ips}).",
+                        evidence=jobs))
+    rc_hits = []
+    for path, lines in host.iter_persistence_rc(homes):
+        for lineno, line in enumerate(lines or [], 1):
+            if not line.lstrip().startswith("#") and _mentions_ip(line, ips):
+                rc_hits.append(f"{path}:{lineno}: {line.strip()[:200]}")
+    if rc_hits:
+        rep.add(Finding(SEV_HIGH, "profile",
+                        "Startup/profile file references an attacker IP "
+                        "discovered in web logs",
+                        f"Startup code mentions an IP that issued exploit-shaped "
+                        f"requests ({title_ips}).",
+                        evidence=rc_hits))
+
+
+def _candidate_iocs(rep: Report) -> list:
+    """Merge per-IP features across attacker IPs and keep what is not already
+    a documented indicator. Each candidate: {kind, value, ips, count,
+    first_seen, last_seen, why}."""
+    merged = {}                                  # (kind, value) -> [count, ips, first, last]
+    for ip, a in rep.ip_activity.items():
+        if not ip:
+            continue
+        if a["exploit"] > 0 and ip not in rep.known_attacker_ips:
+            n = a["exploit"] + a["recon"] + a["other"]
+            merged[("ip", ip)] = [n, {ip}, a["first_dt"], a["last_dt"]]
+        for (kind, value), (count, first, last) in a["features"].items():
+            rec = merged.setdefault((kind, value), [0, set(), first, last])
+            rec[0] += count
+            rec[1].add(ip)
+            if first is not None and (rec[2] is None or first < rec[2]):
+                rec[2] = first
+            if last is not None and (rec[3] is None or last > rec[3]):
+                rec[3] = last
+
+    known_hash = "?" + IOC_ATTACKER_SURVEY_HASH
+    keep = {
+        "ip": lambda v, c, ips: True,
+        "controller": lambda v, c, ips: v.lower() not in KNOWN_EXPLOIT_CONTROLLERS,
+        "survey-hash": lambda v, c, ips: len(ips) >= 2 and v != known_hash,
+        "user-agent": lambda v, c, ips: len(ips) >= 2,
+        "exploit-shape": lambda v, c, ips: True,
+        "2xx-size": lambda v, c, ips: c >= 2,
+        "method": lambda v, c, ips: True,
+        "path": lambda v, c, ips: True,
+    }
+    why = dict(CANDIDATE_KINDS)
+    order = {k: i for i, (k, _w) in enumerate(CANDIDATE_KINDS)}
+    rows = [(kind, value, rec) for (kind, value), rec in merged.items()
+            if kind in keep and keep[kind](value, rec[0], rec[1])]
+    # Within a kind, oldest first: reads as how the attack evolved.
+    rows.sort(key=lambda r: (order[r[0]], r[2][2] is None,
+                             r[2][2].timestamp() if r[2][2] else 0, r[1]))
+    return [{"kind": kind, "value": value, "ips": sorted(ips), "count": count,
+             "first_seen": _iso(first), "last_seen": _iso(last), "why": why[kind]}
+            for kind, value, (count, ips, first, last) in rows]
 
 
 # --------------------------------------------------------------------------- #
@@ -1736,10 +2006,19 @@ def render_text(rep: Report, args) -> str:
                 sts = ", ".join(f"{k}x{v}" for k, v in sorted(a["statuses"].items()))
                 extra = (f", doubled-path 404s={a['doubled_path_404']}"
                          if a["doubled_path_404"] else "")
-                flag = "  <-- NOT the documented IOC IP" if ip != IOC_SOURCE_IP else ""
-                out.append(f"    {ip}  exploit={a['exploit']}  "
+                flag = ("  <-- NOT a known attacker IP"
+                        if ip not in rep.known_attacker_ips else "")
+                other = f"  other={a['other']}" if a["other"] else ""
+                out.append(f"    {ip}  exploit={a['exploit']}{other}  "
                            f"controllers=[{ctrls}]  status=[{sts}]{extra}{flag}")
+                out.append(f"      {a['first_seen'] or a['first']} .. "
+                           f"{a['last_seen'] or a['last']}  "
+                           f"user-agents={len(a['user_agents'])}  "
+                           f"survey-hashes={len(a['survey_hashes'])}")
         out.append("")
+
+    if rep.candidate_iocs and not args.quiet:
+        out.extend(_render_candidates(rep.candidate_iocs))
 
     actionable = [f for f in rep.findings if f.severity not in (SEV_OK,)]
     actionable.sort(key=lambda f: -_SEV_RANK[f.severity])
@@ -1793,6 +2072,28 @@ def render_text(rep: Report, args) -> str:
     return "\n".join(out)
 
 
+def _render_candidates(cands: list) -> list:
+    out = ["Candidate IOCs for review (features of attacker traffic not yet "
+           "covered):"]
+    for kind, why in CANDIDATE_KINDS:
+        rows = [c for c in cands if c["kind"] == kind]
+        if not rows:
+            continue
+        out.append(f"  {kind}: {why}")
+        for c in rows:
+            ips = c["ips"] if len(c["ips"]) <= 4 else \
+                c["ips"][:4] + [f"+{len(c['ips']) - 4} more"]
+            value = f'"{c["value"]}"' if kind == "user-agent" else c["value"]
+            out.append(f"    {value}")
+            out.append(f"      count={c['count']}  ips=[{', '.join(ips)}]  "
+                       f"{c['first_seen'] or '?'} .. {c['last_seen'] or '?'}")
+    out.append("  Not added automatically -- review, then update the IOC "
+               "constants block")
+    out.append("  (or pass recurring IPs to other hosts' scans via --attacker-ip).")
+    out.append("")
+    return out
+
+
 def _wrap(text: str, width: int) -> list:
     words, lines, cur = text.split(), [], ""
     for w in words:
@@ -1820,6 +2121,8 @@ def render_json(rep: Report, args) -> str:
         "mitigation_date": rep.mitigation_date,
         "mitigation_source": rep.mitigation_source,
         "attack_summary": rep.attack_summary,
+        "known_attacker_ips": rep.known_attacker_ips,
+        "candidate_iocs": rep.candidate_iocs,
         "verdict": verdict(rep),
         "findings": [asdict(f) for f in rep.findings if f.severity != SEV_OK],
         "ok_checks": [f.check for f in rep.findings if f.severity == SEV_OK],
@@ -1865,6 +2168,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-log-matches", metavar="N", default=str(MAX_LOG_MATCHES),
                    help=f"Max attack log entries to list per category, kept verbatim "
                         f"(default: {MAX_LOG_MATCHES}). Use 'all' to list every match.")
+    p.add_argument("--attacker-ip", action="append", default=None, metavar="IP",
+                   help="Additional known attacker IP (repeatable), e.g. from another "
+                        "host's scan or threat intel. Treated like the documented IOC "
+                        "IP: all its log traffic, sockets and persistence references "
+                        "are reported.")
     p.add_argument("--json", action="store_true", help="Emit JSON instead of text.")
     p.add_argument("--quiet", action="store_true",
                    help="Suppress OK/INFO lines in text output.")
@@ -1897,6 +2205,14 @@ def run_scan(args, host: HostProvider) -> Report:
         mitigation_date, rep.mitigation_source = detect_mitigation_date(args.redcap_root)
     rep.mitigation_date = mitigation_date.isoformat() if mitigation_date else None
 
+    for ip in getattr(args, "attacker_ip", None) or []:
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            raise ValueError(f"--attacker-ip must be an IP address (got {ip!r})")
+    rep.known_attacker_ips = _dedup(
+        [IOC_SOURCE_IP] + list(getattr(args, "attacker_ip", None) or []))
+
     # How many attack log entries to list (verbatim); 'all' = unlimited.
     _mlm = args.max_log_matches.strip().lower()
     if _mlm in ("all", "none", "unlimited"):
@@ -1919,6 +2235,8 @@ def run_scan(args, host: HostProvider) -> Report:
         ("ssh", lambda: check_authorized_keys(rep, host, homes)),
         ("profile", lambda: check_profiles(rep, host, homes)),
         ("weblog", lambda: check_access_logs(rep, log_dirs, host, mitigation_date, max_matches)),
+        # Second pass over logs + host state using the IPs weblog discovered.
+        ("pivot", lambda: check_attacker_pivot(rep, log_dirs, host, homes, max_matches)),
     ]
     for name, fn in checks:
         try:

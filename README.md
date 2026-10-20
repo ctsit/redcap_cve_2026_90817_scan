@@ -79,6 +79,7 @@ when scanning a possibly-tampered host.
 | `--mitigation-date YYYY-MM-DD` | *auto-detected* | Date the vulnerability was closed by upgrading. See [Attack timing](#attack-timing). |
 | `--full-hash-scan` | off | Recursively hash files under `temp/cache` and staging dirs (slower). |
 | `--max-log-matches N` \| `all` | `100` | How many attack log entries to list per category, kept **verbatim**. |
+| `--attacker-ip IP` (repeatable) | — | Extra known attacker IP (e.g. from another host's scan). Treated like the documented IOC IP. See [Second pass](#second-pass-attacker-pivot--candidate-iocs). |
 | `--json` | off | Emit JSON instead of the text report. |
 | `--quiet` | off | Suppress `OK`/`INFO` lines in text output. |
 
@@ -108,7 +109,8 @@ Each documented IOC maps to a passive local check:
 - **Processes** — miners (XMRig / pool / wallet references), executables running
   from `/var/tmp`, `/dev/shm`, `/tmp`, and `syslog-ng-*` masquerading processes.
 - **Sockets** — the local XMRig JSON-RPC API on `127.0.0.1:50001`, and live
-  connections to the attacker source IP.
+  connections to the attacker source IP(s) — the documented one, any
+  `--attacker-ip`, and every IP the web-log check discovered.
 - **Cron persistence** — fetch-to-shell cradles and IOC references in system and
   per-user crontabs.
 - **SSH `authorized_keys`** — keys matching the attacker's backdoor fingerprint.
@@ -149,6 +151,39 @@ what confirm an actual breach.
 Matched entries are kept **verbatim and untruncated**, each prefixed with its parsed
 date, the reason(s) it matched, and the status ranking, so the raw evidence is
 preserved for review.
+
+### Second pass: attacker pivot & candidate IOCs
+
+Every IP found issuing exploit-shaped requests is fed back through a **second
+pass**:
+
+1. **Logs.** All *other* requests from those IPs are collected — probes, path
+   guessing, follow-up activity. These lines aren't exploit-shaped, so the first
+   pass skips them. They are reported as `Other traffic from N attacker IP(s)
+   discovered by pattern` (MEDIUM).
+2. **Host state.** Live sockets, scheduled jobs, and startup/profile files are
+   searched for those IPs. A hit is HIGH and forces `LIKELY COMPROMISED`, just
+   like a hit on the documented IOC IP.
+3. **Candidate IOCs.** The scanner collects features of all attacker traffic
+   and compares them with what it already knows. It lists anything not yet
+   covered under **Candidate IOCs for review**, in the text report and as
+   `candidate_iocs` in `--json`:
+   - new attacker IPs;
+   - controllers not in `KNOWN_EXPLOIT_CONTROLLERS`;
+   - survey hashes or user agents shared by 2+ attacker IPs;
+   - each distinct exploit request shape (survey hash masked, so encoding
+     changes such as `:` → `%3A` show up);
+   - recurring 2xx response sizes;
+   - non-GET methods;
+   - non-exploit paths.
+
+   Candidates are listed oldest first, so you can read how the attack changed
+   over time.
+
+Candidates are **never added automatically**. Review them, then update the IOC
+constants block if they generalize. To share IPs between hosts, pass them to
+other hosts' scans with `--attacker-ip`. Candidate survey hashes are printed as
+`?s=HASH`, so `sanitize_scan_result.py` masks them as it does any other hash.
 
 ### Attack timing
 

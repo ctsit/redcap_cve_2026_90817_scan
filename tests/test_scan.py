@@ -301,6 +301,91 @@ class HostStateTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# Second-pass attacker pivot (discovered IPs fed back into logs + host state)
+# --------------------------------------------------------------------------- #
+
+PIVOT_LOGDIR = os.path.join(FIXTURES, "pivot_logs")
+
+
+class AttackerPivotTests(unittest.TestCase):
+    def _scan(self, host=None, **kw):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "redcap")
+            os.makedirs(os.path.join(root, "redcap_v17.5.6"))
+            args = make_args(redcap_root=root, log_dir=[PIVOT_LOGDIR],
+                             mitigation_date="2026-09-21", **kw)
+            return scan.run_scan(args, host or FakeProvider())
+
+    def _candidates(self, rep, kind):
+        return [c["value"] for c in rep.candidate_iocs if c["kind"] == kind]
+
+    def test_followup_traffic_from_discovered_ip_is_reported(self):
+        rep = self._scan()
+        pivot = [f for f in findings_by_check(rep)["weblog"]
+                 if f.title.startswith("Other traffic")]
+        self.assertEqual(len(pivot), 1)
+        ev = "\n".join(pivot[0].evidence)
+        self.assertIn("POST /redcap/api/", ev)
+        self.assertIn('"GET /redcap/ HTTP/1.1"', ev)
+        self.assertEqual(rep.attack_summary["by_ip"]["198.51.100.10"]["other"], 2)
+
+    def test_benign_ip_never_appears(self):
+        rep = self._scan()
+        text = scan.render_text(rep, make_args())
+        self.assertNotIn("192.0.2.50", text)
+        self.assertNotIn("192.0.2.50", scan.render_json(rep, make_args()))
+
+    def test_candidates_capture_shared_and_new_features(self):
+        rep = self._scan()
+        self.assertEqual(sorted(self._candidates(rep, "ip")),
+                         ["198.51.100.10", "198.51.100.20", "198.51.100.30"])
+        self.assertEqual(self._candidates(rep, "controller"), ["NewThingController"])
+        self.assertEqual(self._candidates(rep, "survey-hash"), ["?s=SHAREDHSH1"])
+        self.assertIn("python-requests/2.32.5", self._candidates(rep, "user-agent"))
+        self.assertIn("POST", self._candidates(rep, "method"))
+        self.assertEqual(self._candidates(rep, "2xx-size"), ["5"])
+        # Single-IP hash and UA are too weak to surface.
+        self.assertNotIn("?s=OTHERHASH9", self._candidates(rep, "survey-hash"))
+        self.assertNotIn("Mozilla/5.0 (X11; Linux i686)",
+                         self._candidates(rep, "user-agent"))
+
+    def test_socket_to_discovered_ip_flips_verdict(self):
+        host = FakeProvider(sockets=[
+            scan.SockInfo("tcp", "10.0.0.2", 55000, "198.51.100.20", 443, "ESTAB")])
+        rep = self._scan(host)
+        socks = findings_by_check(rep).get("socket", [])
+        self.assertTrue(any(f.severity == scan.SEV_HIGH for f in socks))
+        self.assertIn("LIKELY COMPROMISED (host IOCs present)", scan.verdict(rep))
+
+    def test_cron_mentioning_discovered_ip_flagged(self):
+        host = FakeProvider(jobs=[scan.JobInfo(
+            source="/etc/cron.d/x", lines=["* * * * * root nc 198.51.100.30 4444"])])
+        rep = self._scan(host)
+        self.assertIn("cron", findings_by_check(rep))
+
+    def test_attacker_ip_flag_marks_ip_known(self):
+        rep = self._scan(attacker_ip=["198.51.100.10"])
+        self.assertNotIn("198.51.100.10", self._candidates(rep, "ip"))
+        recon = [f for f in findings_by_check(rep)["weblog"]
+                 if f.title.startswith("Traffic from known")]
+        self.assertTrue(any("POST /redcap/api/" in e for e in recon[0].evidence))
+
+    def test_bad_attacker_ip_rejected(self):
+        with self.assertRaises(ValueError):
+            self._scan(attacker_ip=["not-an-ip"])
+
+    def test_sanitizer_masks_candidate_hashes(self):
+        import sanitize_scan_result as san
+        import random
+        rep = self._scan()
+        text = scan.render_text(rep, make_args())
+        self.assertIn("?s=SHAREDHSH1", text)
+        out, _mapping, _hosts = san.sanitize(text, [], "redcap.example.org",
+                                             random.Random(0))
+        self.assertNotIn("SHAREDHSH1", out)
+
+
+# --------------------------------------------------------------------------- #
 # End-to-end run_scan + verdict
 # --------------------------------------------------------------------------- #
 
