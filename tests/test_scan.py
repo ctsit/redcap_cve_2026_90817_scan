@@ -385,6 +385,79 @@ class AttackerPivotTests(unittest.TestCase):
         self.assertNotIn("SHAREDHSH1", out)
 
 
+class LogWindowTests(unittest.TestCase):
+    """--since / --until limit both log passes; host state is unaffected."""
+
+    UNDATED = ('198.51.100.40 - - "GET /surveys/?s=X&__passthru=%2569ndex.php'
+               '&route=ParcelController%3Ashow HTTP/1.1" 200 5 "-" "x"\n')
+
+    def _scan(self, extra_lines="", old_file=False, **kw):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = os.path.join(tmp, "logs")
+            os.makedirs(logs)
+            src = os.path.join(PIVOT_LOGDIR, "ssl_access.log")
+            with open(src) as fh, open(os.path.join(logs, "ssl_access.log"), "w") as out:
+                out.write(fh.read() + extra_lines)
+            if old_file:
+                old = os.path.join(logs, "ssl_access.log.9")
+                with open(old, "w") as out:
+                    out.write('198.51.100.99 - - [01/Sep/2026:00:00:00 -0400] '
+                              '"GET /surveys/?s=Q&__passthru=%2569ndex.php&route='
+                              'ParcelController%3Ashow HTTP/1.1" 200 5 "-" "x"\n')
+                ts = scan.datetime.datetime(2026, 9, 1).timestamp()
+                os.utime(old, (ts, ts))
+            root = os.path.join(tmp, "redcap")
+            os.makedirs(os.path.join(root, "redcap_v17.5.6"))
+            kw.setdefault("mitigation_date", "2026-09-21")
+            args = make_args(redcap_root=root, log_dir=[logs], **kw)
+            return scan.run_scan(args, FakeProvider())
+
+    def _ips(self, rep):
+        return set((rep.attack_summary or {}).get("distinct_exploit_ips", []))
+
+    def test_since_skips_old_files_and_lines(self):
+        rep = self._scan(old_file=True, since="2026-10-14")
+        self.assertTrue(any("1 log file(s) skipped" in n for n in rep.notes))
+        ips = self._ips(rep)
+        self.assertNotIn("198.51.100.99", ips)
+        self.assertNotIn("202.61.130.221", ips)
+        self.assertIn("198.51.100.10", ips)        # 10-14 line: bound is inclusive
+        self.assertNotIn("202.61.130.221",
+                         [ip for c in rep.candidate_iocs for ip in c["ips"]])
+
+    def test_until_excludes_later_lines(self):
+        rep = self._scan(until="2026-10-15")
+        self.assertNotIn("198.51.100.30", self._ips(rep))
+        self.assertIn("198.51.100.20", self._ips(rep))
+
+    def test_pivot_respects_window(self):
+        rep = self._scan(since="2026-10-15")
+        weblog = findings_by_check(rep).get("weblog", [])
+        ev = "\n".join(e for f in weblog for e in f.evidence)
+        self.assertNotIn("POST /redcap/api/", ev)
+        self.assertNotIn("198.51.100.10", self._ips(rep))
+
+    def test_undated_lines_are_kept(self):
+        rep = self._scan(extra_lines=self.UNDATED, since="2026-10-15")
+        self.assertIn("198.51.100.40", self._ips(rep))
+        self.assertEqual(rep.attack_summary["undated"], 1)
+
+    def test_bad_window_rejected(self):
+        with self.assertRaises(ValueError):
+            self._scan(since="2026-10-20", until="2026-10-01")
+        with self.assertRaises(ValueError):
+            self._scan(since="10/14/2026")
+
+    def test_verdict_caveat_when_window_hides_pre_patch(self):
+        rep = self._scan(since="2026-10-14")
+        self.assertIn("earlier attacks (incl. pre-patch) not examined",
+                      scan.verdict(rep))
+        rep = self._scan(since="2026-09-01")
+        self.assertNotIn("not examined", scan.verdict(rep))
+        text = scan.render_text(rep, make_args())
+        self.assertIn("log window:  2026-09-01 .. (open)", text)
+
+
 # --------------------------------------------------------------------------- #
 # End-to-end run_scan + verdict
 # --------------------------------------------------------------------------- #

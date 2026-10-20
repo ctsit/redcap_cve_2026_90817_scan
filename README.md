@@ -77,6 +77,8 @@ when scanning a possibly-tampered host.
 | `--home-dir DIR` (repeatable) | `/root` + each `/home/*` (Linux); each `C:\Users\*` (Windows) | Extra home dirs to scan for SSH keys / shell/profile files. |
 | `--platform auto`\|`linux`\|`windows` | `auto` | Host platform to assume. Auto-detects from the OS; force it to select a provider (OS-specific host probes still run only on the matching live OS). |
 | `--mitigation-date YYYY-MM-DD` | *auto-detected* | Date the vulnerability was closed by upgrading. See [Attack timing](#attack-timing). |
+| `--since YYYY-MM-DD` | — | Only examine web-log entries on or after this date (inclusive). Log files last modified earlier are not opened. Applies to both log passes; host-state checks are unaffected. See [Attack timing](#attack-timing). |
+| `--until YYYY-MM-DD` | — | Only examine web-log entries on or before this date (inclusive). |
 | `--full-hash-scan` | off | Recursively hash files under `temp/cache` and staging dirs (slower). |
 | `--max-log-matches N` \| `all` | `100` | How many attack log entries to list per category, kept **verbatim**. |
 | `--attacker-ip IP` (repeatable) | — | Extra known attacker IP (e.g. from another host's scan). Treated like the documented IOC IP. See [Second pass](#second-pass-attacker-pivot--candidate-iocs). |
@@ -202,6 +204,13 @@ inferred from the install mtime of the **earliest patched** `redcap_vX.Y.Z`
 directory (the moment the host first ran a non-vulnerable version). The report
 header shows which source was used. Host-state IOCs (known-bad file hash, miner,
 persistence) always force `LIKELY COMPROMISED` regardless of timing.
+
+`--since` / `--until` speed up routine rescans by limiting which log entries are
+examined. Entries without a parseable timestamp are kept. If `--since` is later
+than the mitigation date (or the mitigation date is unknown), the scan did not
+look at the pre-patch period. The verdict then says so (`logs limited to … —
+earlier attacks (incl. pre-patch) not examined`), so a limited scan is never
+mistaken for an all-clear. For a first scan of a host, run without `--since`.
 
 ## Caveats
 

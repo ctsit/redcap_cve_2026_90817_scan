@@ -69,6 +69,8 @@ etc.). So on Windows:
 
 Usage:
     sudo python3 -I redcap_cve_2026_90817_scan.py [--redcap-root PATH] [--json]
+    # only log entries since the last scan:
+    sudo python3 -I redcap_cve_2026_90817_scan.py --since 2026-10-14
 
 Exit codes:
     0  clean and patched (and scan was complete)
@@ -243,6 +245,8 @@ class Report:
     known_attacker_ips: list = field(default_factory=lambda: [IOC_SOURCE_IP])
     ip_activity: dict = field(default_factory=dict)   # per-IP raw aggregates
     candidate_iocs: list = field(default_factory=list)
+    log_since: Optional[datetime.date] = None   # --since: inclusive log window
+    log_until: Optional[datetime.date] = None   # --until
 
     def add(self, f: Finding) -> None:
         self.findings.append(f)
@@ -1577,7 +1581,9 @@ def check_profiles(rep: Report, host: HostProvider, homes: list) -> None:
                         evidence=histfile_hits))
 
 
-def _access_log_files(log_dirs: list, host: HostProvider) -> list:
+def _access_log_files(log_dirs: list, host: HostProvider, since=None) -> tuple:
+    """Return (files, skipped). With `since`, a file last modified before that
+    date is skipped: its mtime is its last write, so every line predates it."""
     files = []
     for d in log_dirs:
         if not os.path.isdir(d):
@@ -1585,7 +1591,29 @@ def _access_log_files(log_dirs: list, host: HostProvider) -> list:
         for pat in host.log_globs():
             files += glob.glob(os.path.join(d, pat))
             files += glob.glob(os.path.join(d, "**", pat), recursive=True)
-    return sorted(set(files))
+    files, skipped = sorted(set(files)), 0
+    if since is not None:
+        kept = []
+        for f in files:
+            try:
+                old = datetime.date.fromtimestamp(os.path.getmtime(f)) < since
+            except OSError:
+                old = False              # let the reader report it unreadable
+            if old:
+                skipped += 1
+            else:
+                kept.append(f)
+        files = kept
+    return files, skipped
+
+
+def _in_window(dt, since, until) -> bool:
+    """True if a log timestamp falls in the inclusive --since/--until window.
+    Undated lines are kept: we cannot prove they fall outside it."""
+    if dt is None:
+        return True
+    d = dt.date()
+    return (since is None or d >= since) and (until is None or d <= until)
 
 
 def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
@@ -1597,7 +1625,10 @@ def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
     # transparently converts W3C rows to the combined-log shape, so everything
     # below is format-agnostic.
     unlimited = max_matches is None
-    files = _access_log_files(log_dirs, host)
+    files, skipped = _access_log_files(log_dirs, host, rep.log_since)
+    if skipped:
+        rep.note(f"{skipped} log file(s) skipped: last modified before "
+                 f"--since {rep.log_since}.")
     if not files:
         rep.note("No web-server access logs found; exploit-attempt check skipped. "
                  "Pass --log-dir if logs live elsewhere.")
@@ -1621,6 +1652,8 @@ def check_access_logs(rep: Report, log_dirs: list, host: HostProvider,
                 if not (ex or rc):
                     continue
                 dt = parse_apache_time(line)
+                if not _in_window(dt, rep.log_since, rep.log_until):
+                    continue
                 tstr = dt.date().isoformat() if dt else "undated"
                 if dt is not None:
                     if earliest is None or dt < earliest:
@@ -1780,7 +1813,8 @@ def _pivot_logs(rep: Report, log_dirs: list, host: HostProvider,
                 pivot_ips: set, max_matches) -> None:
     unlimited = max_matches is None
     evidence, total = [], 0
-    for path in _access_log_files(log_dirs, host):
+    files, _skipped = _access_log_files(log_dirs, host, rep.log_since)
+    for path in files:
         try:
             for line in iter_clf_lines(path):
                 ip, status, size = _parse_clf_fields(line)
@@ -1790,6 +1824,8 @@ def _pivot_logs(rep: Report, log_dirs: list, host: HostProvider,
                 if ex or rc:
                     continue                 # already counted by the first pass
                 dt = parse_apache_time(line)
+                if not _in_window(dt, rep.log_since, rep.log_until):
+                    continue
                 tstr = dt.date().isoformat() if dt else "undated"
                 agg = rep.ip_activity.setdefault(ip, _new_ip_agg(tstr))
                 agg["other"] += 1
@@ -1901,6 +1937,22 @@ def _candidate_iocs(rep: Report) -> list:
 # Rendering & orchestration
 # --------------------------------------------------------------------------- #
 
+def _log_window_str(rep: Report) -> str:
+    return f"{rep.log_since or '(open)'} .. {rep.log_until or '(open)'}"
+
+
+def _window_caveat(rep: Report) -> str:
+    """Verdict suffix when --since hid the pre-patch period from the log
+    checks, so 'post-date mitigation' / 'no attacks' isn't read as all-clear."""
+    if rep.log_since is None:
+        return ""
+    md = rep.mitigation_date
+    if md is not None and rep.log_since <= datetime.date.fromisoformat(md):
+        return ""
+    return (f"; logs limited to {_log_window_str(rep)} -- earlier attacks "
+            "(incl. pre-patch) not examined")
+
+
 def _attack_timing_verdict(rep: Report, s: dict, vuln: bool) -> str:
     """Compromise likelihood from WHEN the logged attacks happened relative to
     the mitigation date. Earliest bucket wins (before > on > after)."""
@@ -1910,6 +1962,7 @@ def _attack_timing_verdict(rep: Report, s: dict, vuln: bool) -> str:
     if s["undated"]:
         tail = (f"; {s['undated']} attack(s) had no parseable timestamp -- "
                 "review manually")
+    tail += _window_caveat(rep)
     if md is None:
         if vuln:
             return (f"ATTACKED and host is still VULNERABLE -- LIKELY COMPROMISED "
@@ -1949,7 +2002,8 @@ def verdict(rep: Report) -> str:
     else:
         s = rep.attack_summary
         if not s or s["total"] == 0:
-            parts.append("no host compromise indicators; no attacks observed in logs")
+            parts.append("no host compromise indicators; no attacks observed in "
+                         f"logs{_window_caveat(rep)}")
         else:
             parts.append(_attack_timing_verdict(rep, s, vuln))
     if vuln:
@@ -1976,6 +2030,8 @@ def render_text(rep: Report, args) -> str:
     if rep.mitigation_source:
         mit += f"  ({rep.mitigation_source})"
     out.append(f"mitigation:  {mit}")
+    if rep.log_since or rep.log_until:
+        out.append(f"log window:  {_log_window_str(rep)}")
     out.append(f"privileges:  {'privileged' if rep.privileged else 'UNPRIVILEGED (scan is partial)'}")
     out.append("=" * 72)
     for i, line in enumerate(_wrap(f"VERDICT: {verdict(rep)}", 70)):
@@ -2122,6 +2178,10 @@ def render_json(rep: Report, args) -> str:
         "mitigation_source": rep.mitigation_source,
         "attack_summary": rep.attack_summary,
         "known_attacker_ips": rep.known_attacker_ips,
+        "log_window": {
+            "since": rep.log_since.isoformat() if rep.log_since else None,
+            "until": rep.log_until.isoformat() if rep.log_until else None,
+        },
         "candidate_iocs": rep.candidate_iocs,
         "verdict": verdict(rep),
         "findings": [asdict(f) for f in rep.findings if f.severity != SEV_OK],
@@ -2165,6 +2225,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "Log attacks are bucketed before/on/after this date to judge "
                         "compromise likelihood. If omitted, inferred from the install "
                         "mtime of the earliest patched redcap_vX.Y.Z directory.")
+    p.add_argument("--since", metavar="YYYY-MM-DD", default=None,
+                   help="Only examine web-server log entries on or after this date. "
+                        "Log files last modified before it are not opened. Applies "
+                        "to the attacker pivot too; host-state checks are unaffected.")
+    p.add_argument("--until", metavar="YYYY-MM-DD", default=None,
+                   help="Only examine web-server log entries on or before this date.")
     p.add_argument("--max-log-matches", metavar="N", default=str(MAX_LOG_MATCHES),
                    help=f"Max attack log entries to list per category, kept verbatim "
                         f"(default: {MAX_LOG_MATCHES}). Use 'all' to list every match.")
@@ -2204,6 +2270,17 @@ def run_scan(args, host: HostProvider) -> Report:
     else:
         mitigation_date, rep.mitigation_source = detect_mitigation_date(args.redcap_root)
     rep.mitigation_date = mitigation_date.isoformat() if mitigation_date else None
+
+    # Optional inclusive date window for the web-log checks.
+    for opt in ("since", "until"):
+        val = getattr(args, opt, None)
+        if val:
+            try:
+                setattr(rep, f"log_{opt}", datetime.date.fromisoformat(val))
+            except ValueError:
+                raise ValueError(f"--{opt} must be YYYY-MM-DD (got {val!r})")
+    if rep.log_since and rep.log_until and rep.log_since > rep.log_until:
+        raise ValueError(f"--since {rep.log_since} is after --until {rep.log_until}")
 
     for ip in getattr(args, "attacker_ip", None) or []:
         try:
